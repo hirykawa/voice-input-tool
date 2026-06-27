@@ -3,14 +3,8 @@
 Voice Input Tool - ReazonSpeech ASR + Silero VAD + Optional LLM Correction
 Mac Mini (Apple Silicon) 向け ローカル音声入力ツール
 
-使い方:
-  python3 voice_input.py              # デフォルト: LLM補正なし
-  python3 voice_input.py --llm        # LLM句読点補正あり (OpenRouter GLM 5.2)
-  python3 voice_input.py --test       # テストWAVで動作確認
-
-ホットキー:
-  Ctrl+Shift+Space : 録音開始/停止トグル
-  Ctrl+Shift+Q     : 終了
+メニューバーアイコンから操作:
+  録音開始/停止、設定画面、終了
 """
 
 import argparse
@@ -21,8 +15,20 @@ import wave
 import numpy as np
 import threading
 import queue
+import logging
 import pyperclip
 from pathlib import Path
+from config import load_config, save_config
+
+# ファイルログ設定
+_log_dir = os.path.expanduser("~/voice-input-tool/logs")
+os.makedirs(_log_dir, exist_ok=True)
+logging.basicConfig(
+    filename=os.path.join(_log_dir, "voice-input.log"),
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("voice_input")
 
 # sherpa-onnx
 import sherpa_onnx
@@ -30,7 +36,10 @@ import sherpa_onnx
 # 音声入力
 import sounddevice as sd
 
-# オプション: キーボードホットキー
+# メニューバーアプリ
+import rumps
+
+# キーボードホットキー
 try:
     from pynput import keyboard
     HAS_HOTKEY = True
@@ -57,17 +66,13 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 BLOCK_SIZE = 512  # 32ms at 16kHz
 
-# VAD パラメータ
-VAD_THRESHOLD = 0.5      # 発話検出閾値
-VAD_SILENCE_DURATION = 0.8  # 無音で発話終了と判断する秒数
-VAD_MIN_SPEECH = 0.3       # 最小発話長（秒）
+# 設定ファイルから読み込み
+APP_CONFIG = load_config()
 
-# LLM補正プロンプト
-LLM_PROMPT = """以下の音声認識結果に、句読点のみを挿入してください。
-文章の変更・言い換え・要約は一切しないでください。
-フィラー（あー、えー、まー）の削除のみ許可します。
-話し言葉を書き言葉に変換しないでください。
-出力は補正後のテキストのみとし、説明やコメントは一切付けないでください。"""
+VAD_THRESHOLD = APP_CONFIG["vad_threshold"]
+VAD_SILENCE_DURATION = APP_CONFIG["vad_silence_duration"]
+VAD_MIN_SPEECH = APP_CONFIG["vad_min_speech"]
+LLM_PROMPT = APP_CONFIG["llm_prompt"]
 
 
 # ============================================================
@@ -83,10 +88,6 @@ def create_recognizer():
 
     if not os.path.exists(int8_encoder):
         print(f"[ERROR] モデルファイルが見つかりません: {int8_encoder}")
-        print("モデルをダウンロードしてください:")
-        print("  cd ~/voice-input-tool/models")
-        print("  curl -LO https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-zipformer-ja-reazonspeech-2024-08-01.tar.bz2")
-        print("  tar xjf sherpa-onnx-zipformer-ja-reazonspeech-2024-08-01.tar.bz2")
         sys.exit(1)
 
     recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
@@ -106,8 +107,6 @@ def create_vad():
     """Silero VADエンジンを作成"""
     if not os.path.exists(VAD_MODEL):
         print(f"[ERROR] VADモデルが見つかりません: {VAD_MODEL}")
-        print("モデルをダウンロードしてください:")
-        print("  curl -LO https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx")
         sys.exit(1)
 
     vad_config = sherpa_onnx.VadModelConfig()
@@ -128,7 +127,7 @@ def create_vad():
 
 def recognize_speech(recognizer, audio_samples):
     """音声サンプルをテキストに変換"""
-    if len(audio_samples) < SAMPLE_RATE * 0.1:  # 0.1秒未満は無視
+    if len(audio_samples) < SAMPLE_RATE * 0.1:
         return ""
 
     stream = recognizer.create_stream()
@@ -146,7 +145,7 @@ def llm_correct(text, api_key=None):
     if not HAS_OPENAI or not text:
         return text
 
-    key = api_key or os.environ.get("OPENROUTER_API_KEY")
+    key = api_key or APP_CONFIG.get("openrouter_api_key") or os.environ.get("OPENROUTER_API_KEY")
     if not key:
         print("[WARN] OPENROUTER_API_KEY が設定されていません。LLM補正をスキップします。")
         return text
@@ -173,7 +172,6 @@ def llm_correct(text, api_key=None):
         )
         corrected = response.choices[0].message.content
         if corrected is None:
-            print("[WARN] LLMが空レスポンスを返しました。元テキストを使用します。")
             return text
         corrected = corrected.strip()
         return corrected if corrected else text
@@ -183,58 +181,146 @@ def llm_correct(text, api_key=None):
 
 
 # ============================================================
-# 出力
+# メニューバーアプリ
 # ============================================================
 
-def output_text(text, mode="clipboard"):
-    """テキストをクリップボードにコピー＆ペースト"""
-    if not text:
-        return
-
-    print(f"\n[認識結果] {text}")
-    
-    if mode == "clipboard":
-        pyperclip.copy(text)
-        print("[クリップボードにコピーしました]")
-    elif mode == "stdout":
-        print(text)
-
-
-# ============================================================
-# リアルタイム録音ループ
-# ============================================================
-
-class VoiceInputApp:
+class VoiceInputApp(rumps.App):
     def __init__(self, recognizer, vad, use_llm=False):
+        super().__init__(
+            "Voice Input",
+            icon=None,
+            title="🎙",
+            quit_button="終了",
+        )
         self.recognizer = recognizer
         self.vad = vad
         self.use_llm = use_llm
         self.is_recording = False
-        self.should_exit = False
         self.audio_queue = queue.Queue()
-        self.speech_buffer = []
-        self.in_speech = False
+        self._stream = None
+        self._process_thread = None
+        self._settings_ctrl = None
 
-    def audio_callback(self, indata, frames, time_info, status):
-        """音声入力コールバック"""
+        self._hotkey_listener = None
+
+        # メニュー構成
+        hotkey_display = self._get_hotkey_display()
+        self.record_button = rumps.MenuItem(
+            f"録音開始 ({hotkey_display})", callback=self.toggle_recording
+        )
+        llm_label = "LLM補正: ON" if self.use_llm else "LLM補正: OFF"
+        self.llm_status = rumps.MenuItem(llm_label)
+        self.settings_button = rumps.MenuItem("設定...", callback=self.open_settings)
+
+        self.menu = [
+            self.record_button,
+            None,
+            self.llm_status,
+            self.settings_button,
+        ]
+
+        # ホットキー登録
+        self._register_hotkey()
+
+    def _get_hotkey_display(self):
+        """設定からホットキーの表示文字列を取得"""
+        from settings_ui import hotkey_to_display
+        hotkey = APP_CONFIG.get("hotkey_record", "<ctrl>+<shift>+<space>")
+        return hotkey_to_display(hotkey)
+
+    def _register_hotkey(self):
+        """グローバルホットキーを登録"""
+        if not HAS_HOTKEY:
+            log.warning("pynput未インストール: ホットキー無効")
+            return
+
+        # 既存のリスナーを停止
+        if self._hotkey_listener:
+            self._hotkey_listener.stop()
+            self._hotkey_listener = None
+
+        hotkey = APP_CONFIG.get("hotkey_record", "<ctrl>+<shift>+<space>")
+        log.info(f"ホットキー登録: {hotkey}")
+
+        try:
+            self._hotkey_listener = keyboard.GlobalHotKeys({
+                hotkey: self.toggle_recording,
+            })
+            self._hotkey_listener.daemon = True
+            self._hotkey_listener.start()
+        except Exception as e:
+            log.error(f"ホットキー登録エラー: {e}")
+
+    def toggle_recording(self, sender=None):
+        if self.is_recording:
+            self.stop_recording()
+        else:
+            self.start_recording()
+
+    def start_recording(self):
+        if self.is_recording:
+            return
+        self.is_recording = True
+        self.title = "🔴"
+        hotkey_display = self._get_hotkey_display()
+        self.record_button.title = f"録音停止 ({hotkey_display})"
+        log.info("録音開始")
+
+        try:
+            self._stream = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                blocksize=BLOCK_SIZE,
+                dtype="float32",
+                callback=self._audio_callback,
+            )
+            self._stream.start()
+            log.info("オーディオストリーム開始")
+        except Exception as e:
+            log.error(f"オーディオストリーム開始エラー: {e}")
+            self.is_recording = False
+            self.title = "🎙"
+            self.record_button.title = "録音開始"
+            return
+
+        self._process_thread = threading.Thread(target=self._process_audio, daemon=True)
+        self._process_thread.start()
+
+    def stop_recording(self):
+        if not self.is_recording:
+            return
+        self.is_recording = False
+        self.title = "🎙"
+        hotkey_display = self._get_hotkey_display()
+        self.record_button.title = f"録音開始 ({hotkey_display})"
+        if self._stream:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+        log.info("録音停止")
+
+    def _audio_callback(self, indata, frames, time_info, status):
+        if status:
+            log.warning(f"オーディオステータス: {status}")
         if self.is_recording:
             samples = indata[:, 0].astype(np.float32)
             self.audio_queue.put(samples.copy())
 
-    def process_audio(self):
-        """音声処理スレッド: VADで発話区間を検出→ASR"""
+    def _process_audio(self):
         audio_buffer = np.array([], dtype=np.float32)
+        chunk_count = 0
 
-        while not self.should_exit:
+        while self.is_recording:
             try:
                 chunk = self.audio_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
+            chunk_count += 1
+            if chunk_count == 1:
+                log.info("音声データ受信開始")
             audio_buffer = np.concatenate([audio_buffer, chunk])
 
-            # VADに1ブロックずつ流す
-            # sherpa-onnx VADは512サンプル単位で処理
             while len(audio_buffer) >= BLOCK_SIZE:
                 block = audio_buffer[:BLOCK_SIZE]
                 audio_buffer = audio_buffer[BLOCK_SIZE:]
@@ -243,92 +329,62 @@ class VoiceInputApp:
 
                 while not self.vad.empty():
                     segment = self.vad.front
+                    speech_samples = np.array(segment.samples)
                     self.vad.pop()
+                    duration = len(speech_samples) / SAMPLE_RATE
+                    log.info(f"VAD検出: {duration:.1f}秒")
 
-                    speech_samples = segment.samples
                     if len(speech_samples) < SAMPLE_RATE * VAD_MIN_SPEECH:
+                        log.info("最小発話長未満、スキップ")
                         continue
 
-                    # ASR実行
                     start = time.time()
                     text = recognize_speech(self.recognizer, speech_samples)
                     elapsed = time.time() - start
 
                     if text:
-                        print(f"\n[ASR {elapsed:.2f}s] {text}")
-                        # LLM補正
+                        log.info(f"ASR ({elapsed:.2f}s): {text}")
                         if self.use_llm:
                             text = llm_correct(text)
-                            print(f"[LLM補正] {text}")
-                        
-                        output_text(text)
+                            log.info(f"LLM補正: {text}")
+                        pyperclip.copy(text)
+                        rumps.notification(
+                            "Voice Input",
+                            "クリップボードにコピーしました",
+                            text[:100],
+                        )
                     else:
-                        print(f"\n[ASR {elapsed:.2f}s] (認識結果なし)")
+                        log.info(f"ASR ({elapsed:.2f}s): 認識結果なし")
 
-    def start_recording(self):
-        """録音開始"""
+    def open_settings(self, sender=None):
+        from settings_ui import SettingsWindowController
+        from Cocoa import NSApp
+        self._settings_ctrl = SettingsWindowController.alloc().initWithCallback_(self._on_settings_saved)
+        self._settings_ctrl.show()
+        NSApp.activateIgnoringOtherApps_(True)
+
+    def _on_settings_saved(self, new_config):
+        global APP_CONFIG, VAD_THRESHOLD, VAD_SILENCE_DURATION, VAD_MIN_SPEECH, LLM_PROMPT
+        APP_CONFIG = new_config
+        self.use_llm = new_config["use_llm"]
+        VAD_THRESHOLD = new_config["vad_threshold"]
+        VAD_SILENCE_DURATION = new_config["vad_silence_duration"]
+        VAD_MIN_SPEECH = new_config["vad_min_speech"]
+        LLM_PROMPT = new_config["llm_prompt"]
+        self.llm_status.title = "LLM補正: ON" if self.use_llm else "LLM補正: OFF"
+        # ホットキー再登録
+        self._register_hotkey()
+        hotkey_display = self._get_hotkey_display()
         if self.is_recording:
-            return
-        self.is_recording = True
-        print("\n[録音開始] 話してください... (Ctrl+Shift+Space で停止)")
-        self.stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            blocksize=BLOCK_SIZE,
-            dtype="float32",
-            callback=self.audio_callback,
-        )
-        self.stream.start()
-
-        # 音声処理スレッド開始
-        self.process_thread = threading.Thread(target=self.process_audio, daemon=True)
-        self.process_thread.start()
-
-    def stop_recording(self):
-        """録音停止"""
-        if not self.is_recording:
-            return
-        self.is_recording = False
-        self.stream.stop()
-        self.stream.close()
-        print("\n[録音停止]")
-
-    def run(self):
-        """メインループ"""
-        if HAS_HOTKEY:
-            print("=== Voice Input Tool ===")
-            print(f"LLM補正: {'ON (GLM 5.2 via OpenRouter)' if self.use_llm else 'OFF'}")
-            print("ホットキー:")
-            print("  Ctrl+Shift+Space : 録音開始/停止")
-            print("  Ctrl+Shift+Q     : 終了")
-            print()
-
-            def on_activate_record():
-                if self.is_recording:
-                    self.stop_recording()
-                else:
-                    self.start_recording()
-
-            def on_activate_exit():
-                self.should_exit = True
-                self.stop_recording()
-                return False  # listener停止
-
-            with keyboard.GlobalHotKeys({
-                '<ctrl>+<shift>+<space>': on_activate_record,
-                '<ctrl>+<shift>+q': on_activate_exit,
-            }) as listener:
-                listener.join()
+            self.record_button.title = f"録音停止 ({hotkey_display})"
         else:
-            # ホットキーなし: Enterで録音トグル
-            print("=== Voice Input Tool (ホットキーなし) ===")
-            print("Enterキーで録音開始/停止。Ctrl+Cで終了。")
-            self.start_recording()
-            try:
-                while not self.should_exit:
-                    time.sleep(0.1)
-            except KeyboardInterrupt:
-                self.stop_recording()
+            self.record_button.title = f"録音開始 ({hotkey_display})"
+        log.info(f"設定更新: LLM={'ON' if self.use_llm else 'OFF'}, "
+                 f"ホットキー={new_config.get('hotkey_record')}")
+
+    def quit_app(self):
+        self.stop_recording()
+        rumps.quit_application()
 
 
 # ============================================================
@@ -340,7 +396,6 @@ def run_test(recognizer, use_llm=False):
     test_dir = os.path.join(MODEL_DIR, "test_wavs")
     transcript_path = os.path.join(test_dir, "transcript.txt")
 
-    # 正解テキスト読み込み
     transcripts = {}
     if os.path.exists(transcript_path):
         with open(transcript_path, "r") as f:
@@ -356,14 +411,12 @@ def run_test(recognizer, use_llm=False):
         if not os.path.exists(wav_path):
             continue
 
-        # WAV読み込み
         with wave.open(wav_path, "rb") as wf:
-            assert wf.getframerate() == SAMPLE_RATE, f"サンプリングレート不一致: {wf.getframerate()}"
+            assert wf.getframerate() == SAMPLE_RATE
             assert wf.getnchannels() == 1
             raw = wf.readframes(wf.getnframes())
             samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
-        # ASR
         start = time.time()
         text = recognize_speech(recognizer, samples)
         elapsed = time.time() - start
@@ -389,20 +442,23 @@ def run_test(recognizer, use_llm=False):
 
 def main():
     parser = argparse.ArgumentParser(description="Voice Input Tool - ReazonSpeech ASR")
-    parser.add_argument("--llm", action="store_true", help="LLM句読点補正を有効化 (OpenRouter GLM 5.2)")
+    parser.add_argument("--llm", action="store_true", help="LLM句読点補正を有効化")
     parser.add_argument("--test", action="store_true", help="テストWAVファイルで動作確認")
     args = parser.parse_args()
 
-    print("モデル読み込み中...", end=" ", flush=True)
+    use_llm = args.llm or APP_CONFIG.get("use_llm", False)
+
+    log.info("モデル読み込み開始")
     start = time.time()
     recognizer = create_recognizer()
     vad = create_vad()
-    print(f"完了 ({time.time()-start:.1f}s)")
+    log.info(f"モデル読み込み完了 ({time.time()-start:.1f}s)")
+    log.info(f"LLM補正: {'ON' if use_llm else 'OFF'}")
 
     if args.test:
-        run_test(recognizer, use_llm=args.llm)
+        run_test(recognizer, use_llm=use_llm)
     else:
-        app = VoiceInputApp(recognizer, vad, use_llm=args.llm)
+        app = VoiceInputApp(recognizer, vad, use_llm=use_llm)
         app.run()
 
 
