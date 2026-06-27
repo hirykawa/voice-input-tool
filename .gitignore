@@ -1,0 +1,18 @@
+# Model files (download separately, see README)
+models/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+*.key
