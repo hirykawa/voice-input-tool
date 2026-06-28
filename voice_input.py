@@ -99,6 +99,12 @@ AUDIO_NOISE_FLOOR_ALPHA_ACTIVE = 0.01
 AUDIO_NOISE_ON_MULTIPLIER = 2.2
 AUDIO_NOISE_OFF_MULTIPLIER = 1.4
 AUDIO_STATUS_UPDATE_INTERVAL = 0.08
+APP_DIR = Path(__file__).resolve().parent
+TYPING_INDICATOR_ICON_FRAMES = tuple(
+    str(APP_DIR / "assets" / f"typing-indicator-{index}.svg")
+    for index in range(6)
+)
+TYPING_INDICATOR_ANIMATION_INTERVAL = 0.12
 
 # 設定ファイルから読み込み
 APP_CONFIG = load_config()
@@ -427,6 +433,12 @@ class VoiceInputApp(rumps.App):
         self._reset_audio_activity_state()
         self._segment_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._reset_vad_audio_history()
+        self._status_icon_frames = None
+        self._status_icon_frame_index = 0
+        self._status_icon_timer = rumps.Timer(
+            self._advance_status_icon,
+            TYPING_INDICATOR_ANIMATION_INTERVAL,
+        )
 
         self._hotkey_listener = None
 
@@ -482,20 +494,55 @@ class VoiceInputApp(rumps.App):
                     return
                 status = self._status
 
-        title, record_title = self._status_labels(status)
-        self.title = title
+        title, record_title, icon_frames = self._status_labels(status)
+        self._set_menu_bar_indicator(title, icon_frames)
         self.record_button.title = record_title
+
+    def _set_menu_bar_indicator(self, title, icon_frames=None):
+        if icon_frames:
+            missing_icons = [icon for icon in icon_frames if not os.path.exists(icon)]
+            if not missing_icons:
+                if self._status_icon_frames != icon_frames:
+                    self._status_icon_frames = icon_frames
+                    self._status_icon_frame_index = 0
+                    self.icon = icon_frames[0]
+                self.title = title
+                if not self._status_icon_timer.is_alive():
+                    self._status_icon_timer.start()
+                return
+
+            log.error("入力中アイコンが見つかりません: %s", ", ".join(missing_icons))
+            title = title or "•••"
+
+        self._stop_status_icon_animation()
+        self.title = title
+        self.icon = None
+
+    def _advance_status_icon(self, _sender=None):
+        icon_frames = self._status_icon_frames
+        if not icon_frames or self._current_status() != "hearing":
+            self._stop_status_icon_animation()
+            return
+
+        self._status_icon_frame_index = (self._status_icon_frame_index + 1) % len(icon_frames)
+        self.icon = icon_frames[self._status_icon_frame_index]
+
+    def _stop_status_icon_animation(self):
+        if self._status_icon_timer.is_alive():
+            self._status_icon_timer.stop()
+        self._status_icon_frames = None
+        self._status_icon_frame_index = 0
 
     def _status_labels(self, status):
         hotkey_display = self._get_hotkey_display()
         states = {
-            "idle": ("🎙", f"録音開始 ({hotkey_display})"),
-            "starting": ("⏳", f"マイク起動中… ({hotkey_display})"),
-            "listening": ("🟢", f"録音停止・入力待機中 ({hotkey_display})"),
-            "hearing": ("🔴", f"録音停止・発話検出中 ({hotkey_display})"),
-            "processing": ("📝", "音声認識中…"),
-            "correcting": ("🧠", "LLM補正中…"),
-            "inserting": ("⌨️", "カーソル位置へ入力中…"),
+            "idle": ("🎙", f"録音開始 ({hotkey_display})", None),
+            "starting": ("⏳", f"マイク起動中… ({hotkey_display})", None),
+            "listening": ("🟢", f"録音停止・入力待機中 ({hotkey_display})", None),
+            "hearing": ("", f"録音停止・音声入力中… ({hotkey_display})", TYPING_INDICATOR_ICON_FRAMES),
+            "processing": ("📝", "音声認識中…", None),
+            "correcting": ("🧠", "LLM補正中…", None),
+            "inserting": ("⌨️", "カーソル位置へ入力中…", None),
         }
         return states.get(status, states["idle"])
 
@@ -866,6 +913,7 @@ class VoiceInputApp(rumps.App):
 
     def quit_app(self):
         self.stop_recording()
+        self._stop_status_icon_animation()
         self._close_audio_stream()
         self._segment_executor.shutdown(wait=False, cancel_futures=True)
         rumps.quit_application()

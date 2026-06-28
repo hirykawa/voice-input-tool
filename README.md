@@ -24,50 +24,209 @@ macOS 向けローカル音声入力ツールです。
 - 認識結果はカーソル位置に入力（貼り付け不可時は補正済みテキストをクリップボードに保持）
 - 詳細ログを `logs/` に出力
 
-## セットアップ
+## 社員向けセットアップ（初回）
 
-### 1. 依存パッケージ
+この手順は、他の社員が自分のMacで最短で使い始めるためのものです。
+
+> 重要: 現在の既定設定では、ツール本体・設定・モデルを `~/voice-input-tool` に置く前提です。別の場所に置く場合は、`voice_input.py` / `config.py` のパス設定も変更してください。
+
+### 0. 事前に必要なもの
+
+- macOS
+- Python 3.11 推奨（3.10以上でも動作想定）
+- ターミナル操作権限
+- 空き容量 2GB 以上（ASRモデルが約1.4GB）
+- LLM補正を使う場合: OpenRouter API Key
+
+Python が入っているか確認します。`python3.11` があれば優先して使います。
+
+```bash
+if command -v python3.11 >/dev/null; then python3.11 --version; else python3 --version; fi
+```
+
+Python がない、または古い場合は、社内の標準手順に従って Python を入れてください。Homebrew を使える環境なら次で入れられます。
+
+```bash
+brew install python@3.11
+```
+
+`git` やビルドツールがない場合は、以下を実行して Command Line Tools を入れます。
+
+```bash
+xcode-select --install
+```
+
+### 1. ツール本体を配置する
+
+社内Gitから取得する場合:
+
+```bash
+cd ~
+git clone <社内GitリポジトリURL> voice-input-tool
+cd ~/voice-input-tool
+```
+
+`<社内GitリポジトリURL>` は、共有時に実際のURLへ置き換えてください。
+
+ZIPや社内ファイル共有で受け取った場合は、展開後のフォルダ名を `voice-input-tool` にして、ホーム直下に置いてください。
+
+```bash
+cd ~
+# 例: Downloads に展開された場合
+mv ~/Downloads/voice-input-tool ~/voice-input-tool
+cd ~/voice-input-tool
+```
+
+### 2. Python仮想環境を作る
 
 ```bash
 cd ~/voice-input-tool
-python3 -m venv .venv
+PYTHON_BIN="$(command -v python3.11 || command -v python3)"
+"$PYTHON_BIN" -m venv .venv
 source .venv/bin/activate
-pip install sherpa-onnx numpy sounddevice pyperclip pynput openai rumps pyobjc
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-### 2. モデルダウンロード
+2回目以降に作業する場合も、コマンド実行前は次で仮想環境を有効化します。
+
+```bash
+cd ~/voice-input-tool
+source .venv/bin/activate
+```
+
+### 3. 音声認識モデルをダウンロードする
 
 ```bash
 mkdir -p ~/voice-input-tool/models
 cd ~/voice-input-tool/models
 
 # ASRモデル (ReazonSpeech K2 v2 int8)
-curl -LO https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-zipformer-ja-reazonspeech-2024-08-01.tar.bz2
+curl -L -O https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-zipformer-ja-reazonspeech-2024-08-01.tar.bz2
 tar xjf sherpa-onnx-zipformer-ja-reazonspeech-2024-08-01.tar.bz2
 
 # VADモデル (Silero)
-curl -LO https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
+curl -L -O https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
+
+cd ~/voice-input-tool
 ```
 
-### 3. OpenRouter API Key
-
-LLM補正を使う場合は `OPENROUTER_API_KEY` が必要です。
+モデル配置を確認します。
 
 ```bash
-# .env ファイルに設定（.gitignore 済み・自動で読み込みます）
-echo "OPENROUTER_API_KEY=sk-or-v1-xxxxx" > ~/voice-input-tool/.env
+test -f models/sherpa-onnx-zipformer-ja-reazonspeech-2024-08-01/encoder-epoch-99-avg-1.int8.onnx && \
+test -f models/sherpa-onnx-zipformer-ja-reazonspeech-2024-08-01/decoder-epoch-99-avg-1.int8.onnx && \
+test -f models/sherpa-onnx-zipformer-ja-reazonspeech-2024-08-01/joiner-epoch-99-avg-1.int8.onnx && \
+test -f models/sherpa-onnx-zipformer-ja-reazonspeech-2024-08-01/tokens.txt && \
+test -f models/silero_vad.onnx && \
+echo "モデル配置 OK"
 ```
 
-または設定画面からAPI Keyを入力できます。その場合も `.env` に保存され、`config.json` には保存しません。
+社内で複数人がセットアップする場合は、上記2ファイル（`.tar.bz2` と `silero_vad.onnx`）を社内ファイル共有に置いてからコピーすると、各自のダウンロード時間を短縮できます。
 
-### 4. macOS アプリとして使う
+### 4. OpenRouter API Keyを設定する（LLM補正を使う場合）
 
-`~/Applications/Voice Input Tool.app` として配置して利用します。Dockには表示されず、メニューバーに 🎙 アイコンとして常駐します。
+LLM補正を使う場合は、`.env` に `OPENROUTER_API_KEY` を保存します。`.env` はGit管理対象外です。
 
-必要な権限:
+```bash
+cd ~/voice-input-tool
+cat > .env <<'EOF'
+OPENROUTER_API_KEY=sk-or-v1-xxxxx
+EOF
+chmod 600 .env
+```
 
-- **マイク**: 音声認識に必要
-- **アクセシビリティ**: グローバルホットキーとカーソル位置への入力に必要
+`sk-or-v1-xxxxx` は各自のAPI Keyに置き換えてください。設定画面からAPI Keyを入力することもできます。その場合も `.env` に保存され、`config.json` には保存されません。
+
+LLM補正を使わない場合は、起動後にメニューバーの `LLM補正: ON/OFF` でOFFにしてください。API Key未設定のままLLM補正ONで使うと、補正に失敗してテキストが出力されません。
+
+### 5. 起動前テストを行う
+
+```bash
+cd ~/voice-input-tool
+source .venv/bin/activate
+python voice_input.py --test
+```
+
+ASRのテスト結果が表示されれば、Python依存関係とモデル配置は正常です。
+
+### 6. 起動する
+
+ターミナルから起動する場合:
+
+```bash
+cd ~/voice-input-tool
+chmod +x start.sh
+./start.sh
+```
+
+起動すると、メニューバーに 🎙 アイコンが表示されます。終了するまでターミナルは閉じないでください。
+
+設定でLLM補正をOFFにした後、一時的にLLM補正ONで起動したい場合は次を使います。
+
+```bash
+./start.sh --llm
+```
+
+### 7. macOSの権限を許可する
+
+初回起動時、または初回録音時に権限許可が必要です。
+
+| 権限 | 用途 | 許可する対象 |
+|------|------|--------------|
+| マイク | 音声入力 | ターミナル / iTerm / `Voice Input Tool.app` |
+| アクセシビリティ | ホットキー、カーソル位置への入力 | ターミナル / iTerm / `Voice Input Tool.app` |
+| 入力監視 | ホットキーが反応しない場合に必要なことがあります | ターミナル / iTerm / `Voice Input Tool.app` |
+
+設定場所:
+
+1. macOSの「システム設定」を開く
+2. 「プライバシーとセキュリティ」を開く
+3. 「マイク」「アクセシビリティ」「入力監視」を確認
+4. 起動に使っているアプリ（Terminal、iTerm、または `Voice Input Tool.app`）を許可
+5. 権限を変更したら、Voice Input Toolを一度終了して再起動
+
+### 8. 動作確認
+
+1. 入力したいアプリ（Slack、Notion、ブラウザ、エディタなど）のテキスト欄にカーソルを置く
+2. `Ctrl+Shift+Space` を押す、またはメニューバーの 🎙 →「録音開始」を選ぶ
+3. 話す
+4. 話している間、メニューバーが三つの白い丸の入力中アイコンに変わることを確認
+5. 少し無音にすると、認識・補正後のテキストがカーソル位置に入力される
+6. 終了するときは、もう一度 `Ctrl+Shift+Space` を押す、またはメニューから停止する
+
+### 9. 任意: ダブルクリックで起動できるアプリにする
+
+ターミナル起動が面倒な場合は、Automatorで簡易アプリを作れます。
+
+1. macOSの「Automator」を開く
+2. 「新規書類」→「アプリケーション」を選ぶ
+3. アクション「シェルスクリプトを実行」を追加
+4. シェルを `/bin/bash` にして、以下を貼り付ける
+
+```bash
+cd "$HOME/voice-input-tool"
+exec "$HOME/voice-input-tool/start.sh"
+```
+
+5. `~/Applications/Voice Input Tool.app` として保存（`~/Applications` がなければ作成）
+6. 次回からこのアプリをダブルクリックして起動
+7. 権限設定では、Terminalではなく `Voice Input Tool.app` を許可
+
+ログイン時に自動起動したい場合は、macOSの「システム設定」→「一般」→「ログイン項目」に `Voice Input Tool.app` を追加してください。
+
+### 10. 更新手順
+
+社内Gitから取得している場合:
+
+```bash
+cd ~/voice-input-tool
+git pull
+source .venv/bin/activate
+python -m pip install -r requirements.txt --upgrade
+```
+
+モデル更新が案内された場合だけ、手順3のモデルダウンロードを再実行してください。
 
 ## 使い方
 
@@ -89,10 +248,10 @@ cd ~/voice-input-tool
 source .venv/bin/activate
 
 # メニューバーアプリとして起動
-python3 voice_input.py --llm
+./start.sh
 
 # テストモード（WAVファイルで動作確認）
-python3 voice_input.py --test
+python voice_input.py --test
 ```
 
 ### ホットキー
@@ -127,12 +286,12 @@ python3 voice_input.py --test
 | 🎙 | 停止中 |
 | ⏳ | マイク起動中 |
 | 🟢 | 入力待機中 |
-| 🔴 | 発話検出中 |
+| ![入力中](assets/typing-indicator.svg) | 音声入力中 |
 | 📝 | 音声認識中 |
 | 🧠 | LLM補正中 |
 | ⌨️ | カーソル位置へ入力中 |
 
-`🔴` / `🟢` の切り替えはマイク入力の音量とノイズ床をもとに判定します。
+入力待機中から音声入力中への切り替えは、マイク入力の音量とノイズ床をもとに判定します。音声入力中は三つの白い丸が順番に跳ねるインジケーターを表示します。
 
 ## 設定画面
 
@@ -198,6 +357,18 @@ tail -n 120 ~/voice-input-tool/logs/voice-input-error.log
 
 ログでは API Key をマスクします。
 
+初期セットアップで詰まりやすい点:
+
+| 症状 | 確認すること |
+|------|--------------|
+| `ModuleNotFoundError` が出る | `cd ~/voice-input-tool` → `source .venv/bin/activate` → `python -m pip install -r requirements.txt` を再実行 |
+| `モデルファイルが見つかりません` と出る | `models/` 配下に ASRモデル展開済みフォルダと `silero_vad.onnx` があるか確認 |
+| メニューバーに何も出ない | ターミナルにエラーが出ていないか確認。`logs/voice-input-error.log` も確認 |
+| マイク入力できない | macOSの「マイク」権限で、起動に使っているアプリを許可して再起動 |
+| `Ctrl+Shift+Space` が効かない | 「アクセシビリティ」と、必要に応じて「入力監視」を許可して再起動。別アプリのショートカットと衝突していないかも確認 |
+| カーソル位置に入力されない | 「アクセシビリティ」権限を確認。貼り付け不可のアプリではクリップボードに残ります |
+| LLM補正で出力されない | `.env` の `OPENROUTER_API_KEY`、OpenRouterの残高、Cerebras providerの利用可否を確認。急ぎの場合はメニューでLLM補正をOFF |
+
 ## ファイル構成
 
 ```
@@ -205,6 +376,8 @@ voice_input.py   - メインアプリ（ASR/VAD/LLM/メニューバー）
 config.py        - 設定ファイル管理（config.json/.env の読み書き）
 settings_ui.py   - ネイティブmacOS設定画面（PyObjC）
 start.sh         - CLI起動用シェルスクリプト
+requirements.txt - Python依存パッケージ一覧
+assets/          - メニューバー用アイコン素材
 models/          - ASR・VADモデル（.gitignore済み）
 logs/            - ログファイル（.gitignore済み）
 config.json      - ユーザー設定（.gitignore済み）

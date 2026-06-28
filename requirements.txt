@@ -1,0 +1,10 @@
+sherpa-onnx
+numpy
+sounddevice
+pyperclip
+pynput
+openai
+rumps
+pyobjc-core
+pyobjc-framework-Cocoa
+pyobjc-framework-ApplicationServices
