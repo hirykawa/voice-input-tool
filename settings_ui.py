@@ -23,6 +23,10 @@ from Cocoa import (
     NSSlider,
     NSControlStateValueOn,
     NSControlStateValueOff,
+    NSEventModifierFlagControl,
+    NSEventModifierFlagShift,
+    NSEventModifierFlagOption,
+    NSEventModifierFlagCommand,
 )
 from config import load_config, save_config
 
@@ -35,6 +39,12 @@ DISPLAY_KEY_MAP = {
     "<space>": "Space",
     "<tab>": "Tab",
     "<enter>": "Enter",
+    "<backspace>": "Backspace",
+    "<esc>": "Esc",
+    "<left>": "Left",
+    "<right>": "Right",
+    "<up>": "Up",
+    "<down>": "Down",
 }
 
 
@@ -96,17 +106,22 @@ def _hint_label(text, x, y, width=300):
 
 class HotkeyField(NSTextField):
     """キー入力をキャプチャするカスタムテキストフィールド"""
-    _captured_keys = objc.ivar()
-    _modifiers = objc.ivar()
+    _hotkey_value = objc.ivar()
+    _previous_display = objc.ivar()
+    _is_recording = objc.ivar()
 
     def initWithFrame_(self, frame):
         self = objc.super(HotkeyField, self).initWithFrame_(frame)
         if self is None:
             return None
-        self._captured_keys = set()
-        self._modifiers = set()
+        self._hotkey_value = None
+        self._previous_display = ""
+        self._is_recording = False
         self.setEditable_(False)
         self.setSelectable_(False)
+        self.setBezeled_(True)
+        self.setDrawsBackground_(True)
+        self.setBackgroundColor_(NSColor.textBackgroundColor())
         self.setFont_(NSFont.systemFontOfSize_(13))
         self.setAlignment_(1)  # center
         return self
@@ -114,60 +129,96 @@ class HotkeyField(NSTextField):
     def acceptsFirstResponder(self):
         return True
 
+    def mouseDown_(self, event):
+        window = self.window()
+        if window is not None:
+            window.makeFirstResponder_(self)
+
     def becomeFirstResponder(self):
+        self._is_recording = True
+        self._previous_display = str(self.stringValue())
         self.setStringValue_("キーを押してください...")
         self.setTextColor_(NSColor.systemBlueColor())
-        return objc.super(HotkeyField, self).becomeFirstResponder()
+        return True
 
     def resignFirstResponder(self):
+        if self._is_recording:
+            self.setStringValue_(self._previous_display)
+        self._is_recording = False
         self.setTextColor_(NSColor.labelColor())
-        return objc.super(HotkeyField, self).resignFirstResponder()
+        return True
 
     def keyDown_(self, event):
-        mods = event.modifierFlags()
-        keycode = event.keyCode()
+        hotkey = self._hotkey_from_event(event)
+        if hotkey is None:
+            return
+        self.setHotkeyValue_(hotkey)
+        self._is_recording = False
+        window = self.window()
+        if window is not None:
+            window.makeFirstResponder_(None)
 
-        parts = []
-        if mods & (1 << 18):  # Control
-            parts.append("<ctrl>")
-        if mods & (1 << 17):  # Shift
-            parts.append("<shift>")
-        if mods & (1 << 19):  # Alt/Option
-            parts.append("<alt>")
-        if mods & (1 << 20):  # Command
-            parts.append("<cmd>")
-
-        # Map keycode to key name
-        key_map = {
-            49: "<space>", 48: "<tab>", 36: "<enter>",
-            0: "a", 1: "s", 2: "d", 3: "f", 4: "h", 5: "g",
-            6: "z", 7: "x", 8: "c", 9: "v", 11: "b",
-            12: "q", 13: "w", 14: "e", 15: "r", 16: "y", 17: "t",
-            31: "o", 32: "i", 33: "[", 34: "p", 35: "]",
-            37: "l", 38: "j", 39: "'", 40: "k", 41: ";",
-            45: "n", 46: "m",
-        }
-        key_name = key_map.get(keycode, f"key{keycode}")
-
-        if not parts:
-            return  # 修飾キーなしは無視
-
-        parts.append(key_name)
-        hotkey = "+".join(parts)
-        self.setStringValue_(hotkey_to_display(hotkey))
-        self.setTextColor_(NSColor.labelColor())
-        # Store the pynput format
-        self._hotkey_value = hotkey
+    def performKeyEquivalent_(self, event):
+        if not self._is_recording:
+            return False
+        self.keyDown_(event)
+        return True
 
     def flagsChanged_(self, event):
         pass  # 修飾キー単体は無視
 
     def getHotkeyValue(self):
-        return getattr(self, '_hotkey_value', None)
+        return self._hotkey_value
 
     def setHotkeyValue_(self, value):
         self._hotkey_value = value
-        self.setStringValue_(hotkey_to_display(value))
+        display = hotkey_to_display(value)
+        self._previous_display = display
+        self.setStringValue_(display)
+        self.setTextColor_(NSColor.labelColor())
+
+    def _hotkey_from_event(self, event):
+        mods = int(event.modifierFlags())
+        parts = []
+        if mods & NSEventModifierFlagControl:
+            parts.append("<ctrl>")
+        if mods & NSEventModifierFlagShift:
+            parts.append("<shift>")
+        if mods & NSEventModifierFlagOption:
+            parts.append("<alt>")
+        if mods & NSEventModifierFlagCommand:
+            parts.append("<cmd>")
+
+        if not parts:
+            return None
+
+        key_name = self._key_name_from_event(event)
+        if key_name is None:
+            return None
+
+        return "+".join(parts + [key_name])
+
+    def _key_name_from_event(self, event):
+        key_map = {
+            49: "<space>", 48: "<tab>", 36: "<enter>", 51: "<backspace>",
+            53: "<esc>", 123: "<left>", 124: "<right>", 125: "<down>", 126: "<up>",
+            0: "a", 1: "s", 2: "d", 3: "f", 4: "h", 5: "g",
+            6: "z", 7: "x", 8: "c", 9: "v", 11: "b",
+            12: "q", 13: "w", 14: "e", 15: "r", 16: "y", 17: "t",
+            31: "o", 32: "i", 33: "[", 34: "p", 35: "]",
+            37: "l", 38: "j", 39: "'", 40: "k", 41: ";",
+            45: "n", 46: "m", 18: "1", 19: "2", 20: "3", 21: "4",
+            23: "5", 22: "6", 26: "7", 28: "8", 25: "9", 29: "0",
+            27: "-", 24: "=", 42: "\\", 43: ",", 47: ".", 44: "/", 50: "`",
+        }
+        keycode = int(event.keyCode())
+        if keycode in key_map:
+            return key_map[keycode]
+
+        chars = event.charactersIgnoringModifiers()
+        if chars and len(chars) == 1 and chars.isprintable():
+            return str(chars).lower()
+        return f"key{keycode}"
 
 
 class SettingsWindowController(NSObject):
@@ -232,7 +283,7 @@ class SettingsWindowController(NSObject):
         self.hotkey_record_field = HotkeyField.alloc().initWithFrame_(NSMakeRect(170, y - 2, 200, 24))
         self.hotkey_record_field.setHotkeyValue_(config.get("hotkey_record", "<ctrl>+<shift>+<space>"))
         content.addSubview_(self.hotkey_record_field)
-        content.addSubview_(_hint_label("クリックしてキーを押して設定", 380, y - 2))
+        content.addSubview_(_hint_label("クリック後、Ctrl/Shift等とキーを押す", 380, y - 2))
         y -= 45
 
         # --- VAD Threshold ---
