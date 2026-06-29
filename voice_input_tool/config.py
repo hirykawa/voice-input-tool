@@ -16,10 +16,6 @@ DOTENV_PATH = os.path.join(CONFIG_DIR, ".env")
 DEFAULTS = {
     "use_llm": True,
     "openrouter_api_key": "",  # 保持はするが、ファイル保存はしない
-    "vad_threshold": 0.5,
-    "vad_silence_duration": 0.8,
-    "vad_min_speech": 0.3,
-    "vad_pre_roll_duration": 0.8,
     "llm_model": "openai/gpt-oss-120b",
     "llm_provider_order": ["Cerebras"],
     "hotkey_record": "<ctrl>+<shift>+<space>",

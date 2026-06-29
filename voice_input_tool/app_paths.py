@@ -11,7 +11,6 @@ MODEL_DIR = str(
     / "models"
     / "sherpa-onnx-zipformer-ja-reazonspeech-2024-08-01"
 )
-VAD_MODEL = str(Path.home() / "voice-input-tool" / "models" / "silero_vad.onnx")
 
 RUNTIME_DIR = APP_DIR / "logs"
 COMMAND_FILE_PATH = str(RUNTIME_DIR / "voice-input-command.txt")

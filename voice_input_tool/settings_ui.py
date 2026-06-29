@@ -21,7 +21,6 @@ from Cocoa import (
     NSObject,
     NSApp,
     NSApplicationActivationPolicyAccessory,
-    NSSlider,
     NSControlStateValueOn,
     NSControlStateValueOff,
     NSEventModifierFlagControl,
@@ -230,12 +229,6 @@ class SettingsWindowController(NSObject):
     window = objc.ivar()
     llm_checkbox = objc.ivar()
     api_key_field = objc.ivar()
-    vad_threshold_slider = objc.ivar()
-    vad_threshold_label = objc.ivar()
-    vad_silence_slider = objc.ivar()
-    vad_silence_label = objc.ivar()
-    vad_min_speech_slider = objc.ivar()
-    vad_min_speech_label = objc.ivar()
     hotkey_record_field = objc.ivar()
     input_device_popup = objc.ivar()
     prompt_textview = objc.ivar()
@@ -251,7 +244,7 @@ class SettingsWindowController(NSObject):
 
     def _build_window(self):
         config = load_config()
-        W, H = 500, 645
+        W, H = 500, 520
 
         self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(200, 200, W, H),
@@ -300,48 +293,6 @@ class SettingsWindowController(NSObject):
         content.addSubview_(self.input_device_popup)
         y -= 45
 
-        # --- VAD Threshold ---
-        content.addSubview_(_label("VAD 発話検出閾値", 20, y))
-        self.vad_threshold_label = _value_label(f"{config['vad_threshold']:.2f}", 420, y)
-        content.addSubview_(self.vad_threshold_label)
-        self.vad_threshold_slider = NSSlider.alloc().initWithFrame_(NSMakeRect(170, y, 240, 24))
-        self.vad_threshold_slider.setMinValue_(0.1)
-        self.vad_threshold_slider.setMaxValue_(0.9)
-        self.vad_threshold_slider.setDoubleValue_(config["vad_threshold"])
-        self.vad_threshold_slider.setTarget_(self)
-        self.vad_threshold_slider.setAction_(b"sliderChanged:")
-        self.vad_threshold_slider.setTag_(1)
-        content.addSubview_(self.vad_threshold_slider)
-        y -= 40
-
-        # --- VAD Silence Duration ---
-        content.addSubview_(_label("無音判定時間 (秒)", 20, y))
-        self.vad_silence_label = _value_label(f"{config['vad_silence_duration']:.1f}", 420, y)
-        content.addSubview_(self.vad_silence_label)
-        self.vad_silence_slider = NSSlider.alloc().initWithFrame_(NSMakeRect(170, y, 240, 24))
-        self.vad_silence_slider.setMinValue_(0.2)
-        self.vad_silence_slider.setMaxValue_(3.0)
-        self.vad_silence_slider.setDoubleValue_(config["vad_silence_duration"])
-        self.vad_silence_slider.setTarget_(self)
-        self.vad_silence_slider.setAction_(b"sliderChanged:")
-        self.vad_silence_slider.setTag_(2)
-        content.addSubview_(self.vad_silence_slider)
-        y -= 40
-
-        # --- VAD Min Speech ---
-        content.addSubview_(_label("最小発話長 (秒)", 20, y))
-        self.vad_min_speech_label = _value_label(f"{config['vad_min_speech']:.1f}", 420, y)
-        content.addSubview_(self.vad_min_speech_label)
-        self.vad_min_speech_slider = NSSlider.alloc().initWithFrame_(NSMakeRect(170, y, 240, 24))
-        self.vad_min_speech_slider.setMinValue_(0.1)
-        self.vad_min_speech_slider.setMaxValue_(2.0)
-        self.vad_min_speech_slider.setDoubleValue_(config["vad_min_speech"])
-        self.vad_min_speech_slider.setTarget_(self)
-        self.vad_min_speech_slider.setAction_(b"sliderChanged:")
-        self.vad_min_speech_slider.setTag_(3)
-        content.addSubview_(self.vad_min_speech_slider)
-        y -= 45
-
         # --- LLM Prompt ---
         content.addSubview_(_label("LLM 補正プロンプト", 20, y))
         y -= 10
@@ -383,16 +334,6 @@ class SettingsWindowController(NSObject):
         reset_btn.setAction_(b"resetClicked:")
         content.addSubview_(reset_btn)
 
-    @objc.typedSelector(b"v@:@")
-    def sliderChanged_(self, sender):
-        tag = sender.tag()
-        if tag == 1:
-            self.vad_threshold_label.setStringValue_(f"{sender.doubleValue():.2f}")
-        elif tag == 2:
-            self.vad_silence_label.setStringValue_(f"{sender.doubleValue():.1f}")
-        elif tag == 3:
-            self.vad_min_speech_label.setStringValue_(f"{sender.doubleValue():.1f}")
-
     def _populate_input_devices(self, selected_device_id):
         self.input_device_popup.removeAllItems()
         self.input_device_popup.addItemWithTitle_("自動選択")
@@ -427,9 +368,6 @@ class SettingsWindowController(NSObject):
             "openrouter_api_key": str(self.api_key_field.stringValue()),
             "hotkey_record": hotkey_val if hotkey_val else "<ctrl>+<shift>+<space>",
             "input_device_id": input_device_id,
-            "vad_threshold": round(self.vad_threshold_slider.doubleValue(), 2),
-            "vad_silence_duration": round(self.vad_silence_slider.doubleValue(), 1),
-            "vad_min_speech": round(self.vad_min_speech_slider.doubleValue(), 1),
             "llm_prompt": str(self.prompt_textview.string()),
         })
         save_config(config)
@@ -447,12 +385,6 @@ class SettingsWindowController(NSObject):
         self.llm_checkbox.setState_(NSControlStateValueOn if DEFAULTS["use_llm"] else NSControlStateValueOff)
         self.hotkey_record_field.setHotkeyValue_(DEFAULTS["hotkey_record"])
         self._populate_input_devices(DEFAULTS["input_device_id"])
-        self.vad_threshold_slider.setDoubleValue_(DEFAULTS["vad_threshold"])
-        self.vad_threshold_label.setStringValue_(f"{DEFAULTS['vad_threshold']:.2f}")
-        self.vad_silence_slider.setDoubleValue_(DEFAULTS["vad_silence_duration"])
-        self.vad_silence_label.setStringValue_(f"{DEFAULTS['vad_silence_duration']:.1f}")
-        self.vad_min_speech_slider.setDoubleValue_(DEFAULTS["vad_min_speech"])
-        self.vad_min_speech_label.setStringValue_(f"{DEFAULTS['vad_min_speech']:.1f}")
         self.prompt_textview.setString_(DEFAULTS["llm_prompt"])
 
     def show(self):

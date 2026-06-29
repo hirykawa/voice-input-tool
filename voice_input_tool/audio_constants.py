@@ -1,4 +1,4 @@
-"""Audio format constants used across capture, VAD, and ASR."""
+"""Audio format constants used across capture and ASR."""
 
 SAMPLE_RATE = 16000
 CHANNELS = 1

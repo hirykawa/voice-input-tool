@@ -50,7 +50,7 @@ def write_status(status, title, record_title, use_llm):
     }
     try:
         os.makedirs(os.path.dirname(STATUS_FILE_PATH), exist_ok=True)
-        tmp_path = f"{STATUS_FILE_PATH}.tmp"
+        tmp_path = f"{STATUS_FILE_PATH}.{os.getpid()}.{time.time_ns()}.tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
         os.replace(tmp_path, STATUS_FILE_PATH)

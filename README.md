@@ -1,16 +1,15 @@
 # Voice Input Tool
 
-ReazonSpeech (sherpa-onnx) + Silero VAD + OpenRouter/Cerebras GPT OSS による
+ReazonSpeech (sherpa-onnx) + OpenRouter/Cerebras GPT OSS による
 macOS 向けローカル音声入力ツールです。
 
 ## 特徴
 
 - 完全ローカルASR（ReazonSpeech K2 v2 int8）
-- Silero VAD による発話区間自動検出
 - マイク入力を事前準備し、録音開始直後の頭欠けを抑制
-- VAD検出前の音声も先頭補完し、話し始めの欠落を抑制
 - 録音は明示的に停止するまで継続（無音では停止しない）
-- 無音で発話区間が確定したら、ASR/LLM補正/入力処理を聞き取りとは別スレッドで実行
+- 文字起こし・LLM補正・入力処理は録音停止後に一括実行
+- ASRモデルは初回文字起こし時に遅延読み込みし、起動を軽くする
 - LLM補正オン/オフ切替可能（デフォルト: ON）
 - LLM補正ON時は、必ずLLM補正後のテキストだけを出力（未補正フォールバックなし）
 - OpenRouter 経由で Cerebras の GPT OSS を使用
@@ -105,9 +104,6 @@ cd ~/voice-input-tool/models
 curl -L -O https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-zipformer-ja-reazonspeech-2024-08-01.tar.bz2
 tar xjf sherpa-onnx-zipformer-ja-reazonspeech-2024-08-01.tar.bz2
 
-# VADモデル (Silero)
-curl -L -O https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
-
 cd ~/voice-input-tool
 ```
 
@@ -118,11 +114,10 @@ test -f models/sherpa-onnx-zipformer-ja-reazonspeech-2024-08-01/encoder-epoch-99
 test -f models/sherpa-onnx-zipformer-ja-reazonspeech-2024-08-01/decoder-epoch-99-avg-1.int8.onnx && \
 test -f models/sherpa-onnx-zipformer-ja-reazonspeech-2024-08-01/joiner-epoch-99-avg-1.int8.onnx && \
 test -f models/sherpa-onnx-zipformer-ja-reazonspeech-2024-08-01/tokens.txt && \
-test -f models/silero_vad.onnx && \
 echo "モデル配置 OK"
 ```
 
-社内で複数人がセットアップする場合は、上記2ファイル（`.tar.bz2` と `silero_vad.onnx`）を社内ファイル共有に置いてからコピーすると、各自のダウンロード時間を短縮できます。
+社内で複数人がセットアップする場合は、上記 `.tar.bz2` を社内ファイル共有に置いてからコピーすると、各自のダウンロード時間を短縮できます。
 
 ### 4. OpenRouter API Keyを設定する（LLM補正を使う場合）
 
@@ -192,8 +187,8 @@ chmod +x start.sh
 2. `Ctrl+Shift+Space` を押す、またはメニューバーの 🎙 →「録音開始」を選ぶ
 3. 話す
 4. 話している間、メニューバーが三つの白い丸の入力中アイコンに変わることを確認
-5. 少し無音にすると、認識・補正後のテキストがカーソル位置に入力される
-6. 終了するときは、もう一度 `Ctrl+Shift+Space` を押す、またはメニューから停止する
+5. もう一度 `Ctrl+Shift+Space` を押す、またはメニューから停止する
+6. 録音停止後、認識・補正後のテキストがカーソル位置に入力される
 
 ### 9. ダブルクリックで起動する
 
@@ -248,17 +243,15 @@ python voice_input.py --test --no-llm
 ## 入力フロー
 
 1. ホットキー/メニューで録音開始
-2. マイク入力をキューに蓄積
-3. 無音で発話区間が確定
-4. 発話区間を別スレッドへ投入
-5. ASRでテキスト化
-6. LLM補正ONの場合は Cerebras GPT OSS で整形
-7. 補正済みテキストを録音開始時の前面アプリへ入力
-8. 録音は停止コマンドまで継続
+2. マイク入力をメモリ上に蓄積
+3. ホットキー/メニューで録音停止
+4. 停止後に録音全体をASRでテキスト化
+5. LLM補正ONの場合は Cerebras GPT OSS で整形
+6. 補正済みテキストを録音開始時の前面アプリへ入力
 
 重要な仕様:
 
-- 無音は「発話区間の区切り」であり、「録音停止」ではありません。
+- 無音では文字起こしを開始しません。停止操作後にだけ文字起こしします。
 - LLM補正ON時は、LLM補正が成功したテキストだけを出力します。
 - LLM補正に失敗した場合、未補正テキストは出力しません。
 - LLM補正OFF時は、ASR結果をそのまま出力します。
@@ -290,9 +283,6 @@ python voice_input.py --test --no-llm
 | OpenRouter API Key | LLM補正用APIキー | `.env` から読み込み |
 | 録音 開始/停止 | ホットキー設定 | Ctrl+Shift+Space |
 | 入力マイク | 使用するマイク。未選択時はシステムの既定入力 | 自動選択 |
-| VAD 発話検出閾値 | 発話と判定する閾値 (0.1-0.9) | 0.5 |
-| 無音判定時間 | 発話終了と判断する無音の長さ (0.2-3.0秒) | 0.8秒 |
-| 最小発話長 | 認識対象とする最短の発話長 (0.1-2.0秒) | 0.3秒 |
 | LLM 補正プロンプト | LLM補正時のシステムプロンプト | 句読点挿入のみ |
 
 設定は `~/voice-input-tool/config.json` に保存されます。API Key は `.env` に保存され、`config.json` には保存されません。
@@ -305,7 +295,6 @@ python voice_input.py --test --no-llm
 |------|--------|------|
 | `llm_model` | `openai/gpt-oss-120b` | OpenRouter のモデル名 |
 | `llm_provider_order` | `["Cerebras"]` | 使用する provider |
-| `vad_pre_roll_duration` | `0.8` | VAD検出前に補完する音声秒数 |
 
 LLMリクエストでは provider fallback を無効にしています。Cerebras が利用できない場合、LLM補正は失敗し、LLM補正ONでは出力されません。
 
@@ -350,7 +339,7 @@ tail -n 120 ~/voice-input-tool/logs/voice-input-error.log
 | 症状 | 確認すること |
 |------|--------------|
 | `ModuleNotFoundError` が出る | `cd ~/voice-input-tool` → `source .venv-framework/bin/activate` → `python -m pip install -r requirements.txt` を再実行 |
-| `モデルファイルが見つかりません` と出る | `models/` 配下に ASRモデル展開済みフォルダと `silero_vad.onnx` があるか確認 |
+| `モデルファイルが見つかりません` と出る | `models/` 配下に ASRモデル展開済みフォルダがあるか確認 |
 | メニューバーに何も出ない | `~/Applications/VoiceInputTool.app` を起動しているか確認。`logs/native-status.log` と `logs/native-engine.err.log` も確認 |
 | マイク入力できない | macOSの「マイク」権限で、起動に使っているアプリを許可して再起動 |
 | `Ctrl+Shift+Space` が効かない | 「アクセシビリティ」と、必要に応じて「入力監視」を許可して再起動。別アプリのショートカットと衝突していないかも確認 |
@@ -361,14 +350,14 @@ tail -n 120 ~/voice-input-tool/logs/voice-input-error.log
 
 ```
 voice_input.py       - CLIエントリーポイント（互換用ラッパー）
-voice_input_tool/    - Python実装（engine/ASR/VAD/LLM/設定UI/ネイティブ連携）
+voice_input_tool/    - Python実装（engine/ASR/LLM/設定UI/ネイティブ連携）
 native/              - macOSネイティブ常駐アプリ/ランチャーのソース
 packaging/           - VoiceInputTool.app 用 Info.plist
 launch-agents/       - 自動起動用 LaunchAgent サンプル
 assets/              - メニューバー用アイコン素材
 start.sh             - CLI起動用シェルスクリプト
 requirements.txt     - Python依存パッケージ一覧
-models/              - ASR・VADモデル（.gitignore済み）
+models/              - ASRモデル（.gitignore済み）
 logs/                - ログファイル（.gitignore済み）
 config.json          - ユーザー設定（.gitignore済み）
 .env                 - 環境変数（.gitignore済み）
@@ -379,12 +368,11 @@ config.json          - ユーザー設定（.gitignore済み）
 | 項目 | 結果 |
 |------|------|
 | ASR処理速度 | 0.06〜0.16秒（10秒程度の音声） |
-| モデル読み込み | 0.4〜0.5秒 |
+| モデル読み込み | 初回文字起こし時に遅延実行 |
 | 日本語精度 | テスト5問中ほぼ完璧 |
 | LLM補正 | 句読点のみ挿入、文章変更なし |
 
 ## モデル
 
 - ASR: sherpa-onnx-zipformer-ja-reazonspeech-2024-08-01 (int8)
-- VAD: silero_vad.onnx
 - LLM: openai/gpt-oss-120b (OpenRouter経由、Cerebras固定・fallback無効)

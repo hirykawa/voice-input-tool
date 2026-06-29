@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Voice Input Tool - ReazonSpeech ASR + Silero VAD + Optional LLM Correction
+Voice Input Tool - ReazonSpeech ASR + Optional LLM Correction
 Mac Mini (Apple Silicon) 向け ローカル音声入力ツール
 
 メニューバーアイコンから操作:
@@ -8,7 +8,6 @@ Mac Mini (Apple Silicon) 向け ローカル音声入力ツール
 """
 
 import argparse
-import concurrent.futures
 import os
 import signal
 import sys
@@ -16,17 +15,11 @@ import time
 import wave
 import numpy as np
 import threading
-import queue
 import logging
 from voice_input_tool.app_paths import LOG_DIR, MODEL_DIR
 from voice_input_tool.audio_constants import BLOCK_SIZE, CHANNELS, SAMPLE_RATE
 from voice_input_tool.audio_devices import resolve_input_device
-from voice_input_tool.audio_pipeline import (
-    AudioActivityTracker,
-    VadAudioHistory,
-    drain_vad_segments,
-    process_audio_queue,
-)
+from voice_input_tool.audio_pipeline import AudioActivityTracker
 from voice_input_tool.app_status import AppStatusController
 from voice_input_tool.config import load_config, save_config
 from voice_input_tool.llm_correction import configure_llm, llm_correct
@@ -46,7 +39,7 @@ from voice_input_tool.native_bridge import (
     write_output,
 )
 from voice_input_tool.notifications import notify_user
-from voice_input_tool.speech_engine import create_recognizer, create_vad, recognize_speech
+from voice_input_tool.speech_engine import create_recognizer, recognize_speech
 from voice_input_tool.status_bar_diagnostics import install_status_bar_diagnostics
 
 # ファイルログ設定
@@ -95,15 +88,7 @@ except ImportError:
 # 設定ファイルから読み込み
 APP_CONFIG = load_config()
 
-VAD_THRESHOLD = APP_CONFIG["vad_threshold"]
-VAD_SILENCE_DURATION = APP_CONFIG["vad_silence_duration"]
-VAD_MIN_SPEECH = APP_CONFIG["vad_min_speech"]
-VAD_PRE_ROLL_DURATION = APP_CONFIG.get("vad_pre_roll_duration", 0.8)
 configure_llm(APP_CONFIG)
-
-
-def build_vad():
-    return create_vad(VAD_THRESHOLD, VAD_SILENCE_DURATION, VAD_MIN_SPEECH)
 
 
 # ============================================================
@@ -116,7 +101,7 @@ class _HeadlessMenuItem:
 
 
 class VoiceInputApp(rumps.App):
-    def __init__(self, recognizer, vad, use_llm=False, headless=False, native_output=False):
+    def __init__(self, recognizer=None, use_llm=False, headless=False, native_output=False):
         self._headless = headless
         self._native_output = native_output
         if not headless:
@@ -130,10 +115,8 @@ class VoiceInputApp(rumps.App):
             self.title = "VI"
             self.icon = None
         self.recognizer = recognizer
-        self.vad = vad
         self.use_llm = use_llm
         self.is_recording = False
-        self.audio_queue = queue.Queue()
         self._stream = None
         self._process_thread = None
         self._settings_ctrl = None
@@ -143,8 +126,9 @@ class VoiceInputApp(rumps.App):
         self._has_audio_started = False
         self._start_requested_at = None
         self._audio_activity = AudioActivityTracker()
-        self._segment_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        self._vad_history = VadAudioHistory()
+        self._recorded_chunks = []
+        self._recording_lock = threading.Lock()
+        self._recognizer_lock = threading.Lock()
 
         self._hotkey_listener = None
 
@@ -272,10 +256,9 @@ class VoiceInputApp(rumps.App):
         if self._process_thread and self._process_thread.is_alive():
             log.info("前回の音声処理中のため録音開始をスキップ")
             return
-        self.audio_queue = queue.Queue()
-        self.vad.reset()
-        self._vad_history.reset()
         self._audio_activity.reset()
+        with self._recording_lock:
+            self._recorded_chunks = []
         self._target_pid = target_pid if target_pid and target_pid > 0 else None
         self._target_app = None if self._target_pid else get_frontmost_application()
         self._has_audio_started = False
@@ -291,72 +274,82 @@ class VoiceInputApp(rumps.App):
             self._set_status("idle")
             return
 
-        self._process_thread = threading.Thread(target=self._process_audio, daemon=True)
-        self._process_thread.start()
-
     def stop_recording(self):
         if not self.is_recording:
             return
-        self.is_recording = False
+        with self._recording_lock:
+            self.is_recording = False
+            recorded_chunks = self._recorded_chunks
+            self._recorded_chunks = []
+
+        target_app = self._target_app
+        target_pid = self._target_pid
         self._has_audio_started = False
         self._start_requested_at = None
         self._audio_activity.reset()
-        self._set_status("idle")
-        log.info("録音停止")
+
+        if not recorded_chunks:
+            self._set_status("idle")
+            log.info("録音停止: 音声データなし")
+            return
+
+        duration = sum(len(chunk) for chunk in recorded_chunks) / SAMPLE_RATE
+        log.info("録音停止: %.1f秒 target_pid=%s", duration, target_pid or app_target_pid(target_app))
+        self._set_status("processing")
+        self._process_thread = threading.Thread(
+            target=self._process_recording_after_stop,
+            args=(recorded_chunks, target_app, target_pid),
+            daemon=True,
+        )
+        self._process_thread.start()
 
     def _audio_callback(self, indata, frames, time_info, status):
         if status:
             log.warning(f"オーディオステータス: {status}")
-        if self.is_recording:
-            samples = indata[:, 0].astype(np.float32)
-            if not self._has_audio_started:
-                self._has_audio_started = True
-                if self._start_requested_at is not None:
-                    elapsed = time.time() - self._start_requested_at
-                    log.info(f"入力待機開始 ({elapsed:.2f}s)")
-                self._set_status("listening")
-            self._update_live_audio_status(samples)
-            self.audio_queue.put(samples.copy())
+        samples = indata[:, 0].astype(np.float32)
+        with self._recording_lock:
+            if not self.is_recording:
+                return
+            self._recorded_chunks.append(samples.copy())
+
+        if not self._has_audio_started:
+            self._has_audio_started = True
+            if self._start_requested_at is not None:
+                elapsed = time.time() - self._start_requested_at
+                log.info(f"入力待機開始 ({elapsed:.2f}s)")
+            self._set_status("listening")
+            log.info("音声データ受信開始")
+        self._update_live_audio_status(samples)
 
     def _update_live_audio_status(self, samples):
         new_status = self._audio_activity.status_for_samples(samples, self._current_status())
         if new_status is not None:
             self._set_status(new_status)
 
-    def _process_audio(self):
-        process_audio_queue(
-            self.audio_queue,
-            lambda: self.is_recording,
-            self.vad,
-            self._vad_history,
-            self._process_vad_segments,
-        )
+    def _process_recording_after_stop(self, recorded_chunks, target_app, target_pid):
+        speech_samples = np.concatenate(recorded_chunks).astype(np.float32, copy=False)
+        self._handle_speech_segment(speech_samples, target_app, target_pid)
 
-    def _process_vad_segments(self):
-        target_app = self._target_app
-        target_pid = self._target_pid
+    def _ensure_recognizer(self):
+        if self.recognizer is not None:
+            return self.recognizer
 
-        def submit_segment(speech_samples):
-            self._segment_executor.submit(
-                self._handle_speech_segment,
-                speech_samples,
-                target_app,
-                target_pid,
-            )
+        with self._recognizer_lock:
+            if self.recognizer is not None:
+                return self.recognizer
 
-        drain_vad_segments(
-            self.vad,
-            self._vad_history,
-            VAD_MIN_SPEECH,
-            VAD_PRE_ROLL_DURATION,
-            submit_segment,
-        )
+            log.info("ASRモデル読み込み開始")
+            start = time.time()
+            self.recognizer = create_recognizer()
+            log.info("ASRモデル読み込み完了 (%.1fs)", time.time() - start)
+            return self.recognizer
 
     def _handle_speech_segment(self, speech_samples, target_app, target_pid_value=None):
         try:
             self._set_status("processing")
             start = time.time()
-            text = recognize_speech(self.recognizer, speech_samples)
+            recognizer = self._ensure_recognizer()
+            text = recognize_speech(recognizer, speech_samples)
             elapsed = time.time() - start
 
             if not text:
@@ -453,19 +446,13 @@ class VoiceInputApp(rumps.App):
         self._set_status(self._current_status(), force=True)
 
     def _on_settings_saved(self, new_config):
-        global APP_CONFIG, VAD_THRESHOLD, VAD_SILENCE_DURATION, VAD_MIN_SPEECH, VAD_PRE_ROLL_DURATION
+        global APP_CONFIG
         APP_CONFIG = new_config
         self.use_llm = new_config["use_llm"]
-        VAD_THRESHOLD = new_config["vad_threshold"]
-        VAD_SILENCE_DURATION = new_config["vad_silence_duration"]
-        VAD_MIN_SPEECH = new_config["vad_min_speech"]
-        VAD_PRE_ROLL_DURATION = new_config.get("vad_pre_roll_duration", VAD_PRE_ROLL_DURATION)
         configure_llm(new_config)
         self.llm_status.title = "LLM補正: ON" if self.use_llm else "LLM補正: OFF"
         if not self.is_recording:
-            self.vad = build_vad()
             self._close_audio_stream()
-            self._ensure_audio_stream()
         # ホットキー再登録
         self._register_hotkey()
         self._set_status(self._current_status(), force=True)
@@ -477,7 +464,6 @@ class VoiceInputApp(rumps.App):
         self.stop_recording()
         self._stop_status_icon_animation()
         self._close_audio_stream()
-        self._segment_executor.shutdown(wait=False, cancel_futures=True)
         rumps.quit_application()
 
 
@@ -549,8 +535,8 @@ def run_settings_window():
     return 0
 
 
-def run_headless_app(recognizer, vad, use_llm=False):
-    app = VoiceInputApp(recognizer, vad, use_llm=use_llm, headless=True, native_output=True)
+def run_headless_app(use_llm=False):
+    app = VoiceInputApp(use_llm=use_llm, headless=True, native_output=True)
     app._set_status("idle", force=True)
 
     try:
@@ -605,7 +591,6 @@ def run_headless_app(recognizer, vad, use_llm=False):
         app.stop_recording()
         app._stop_status_icon_animation()
         app._close_audio_stream()
-        app._segment_executor.shutdown(wait=False, cancel_futures=True)
         log.info("ヘッドレス音声入力エンジン終了")
 
 
@@ -627,17 +612,16 @@ def main():
     if args.settings:
         sys.exit(run_settings_window())
 
-    log.info("モデル読み込み開始")
-    start = time.time()
-    recognizer = create_recognizer()
-    vad = build_vad()
-    log.info(f"モデル読み込み完了 ({time.time()-start:.1f}s)")
     log.info(f"LLM補正: {'ON' if use_llm else 'OFF'}")
 
     if args.test:
+        log.info("ASRモデル読み込み開始")
+        start = time.time()
+        recognizer = create_recognizer()
+        log.info(f"ASRモデル読み込み完了 ({time.time()-start:.1f}s)")
         run_test(recognizer, use_llm=use_llm)
     elif args.headless:
-        run_headless_app(recognizer, vad, use_llm=use_llm)
+        run_headless_app(use_llm=use_llm)
     else:
         install_status_bar_diagnostics()
         if HAS_APPKIT_APPLICATION:
@@ -648,7 +632,7 @@ def main():
                 log.exception("アプリ表示モードの設定に失敗しました")
         if HAS_APP_HELPER:
             AppHelper.callLater(2.0, lambda: log.info("メニューバーイベントループ稼働中"))
-        app = VoiceInputApp(recognizer, vad, use_llm=use_llm)
+        app = VoiceInputApp(use_llm=use_llm)
         log.info("メニューバーイベントループ開始")
         app.run()
         log.error("メニューバーイベントループが終了しました")

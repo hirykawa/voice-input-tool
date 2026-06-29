@@ -1,12 +1,9 @@
-"""Audio activity and VAD segment pipeline helpers."""
+"""Audio activity helpers for live recording status."""
 
 import logging
-import queue
 import time
 
 import numpy as np
-
-from voice_input_tool.audio_constants import BLOCK_SIZE, SAMPLE_RATE
 
 log = logging.getLogger("voice_input")
 
@@ -68,116 +65,3 @@ class AudioActivityTracker:
                 off_threshold,
             )
         return new_status
-
-
-class VadAudioHistory:
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.blocks = []
-        self.sample_count = 0
-
-    def accept_block(self, vad, block):
-        self.blocks.append((self.sample_count, block.copy()))
-        self.sample_count += len(block)
-        vad.accept_waveform(block)
-
-    def segment_samples_with_preroll(self, segment, pre_roll_duration, sample_rate=SAMPLE_RATE):
-        segment_samples = np.array(segment.samples, dtype=np.float32)
-        segment_start = int(getattr(segment, "start", 0))
-        segment_end = segment_start + len(segment_samples)
-        pre_roll_samples = int(sample_rate * pre_roll_duration)
-        padded_start = max(0, segment_start - pre_roll_samples)
-
-        speech_samples = self._audio_range(padded_start, segment_end)
-        if len(speech_samples) == 0:
-            speech_samples = segment_samples
-
-        added = max(0, min(segment_start, segment_end) - padded_start)
-        if added:
-            log.info("VAD先頭補完: %.2f秒", added / sample_rate)
-
-        self._prune(max(0, segment_end - pre_roll_samples))
-        return speech_samples
-
-    def _audio_range(self, start, end):
-        chunks = []
-        for block_start, block in self.blocks:
-            block_end = block_start + len(block)
-            if block_end <= start:
-                continue
-            if block_start >= end:
-                break
-            chunk_start = max(0, start - block_start)
-            chunk_end = min(len(block), end - block_start)
-            if chunk_start < chunk_end:
-                chunks.append(block[chunk_start:chunk_end])
-        if not chunks:
-            return np.array([], dtype=np.float32)
-        return np.concatenate(chunks).astype(np.float32, copy=False)
-
-    def _prune(self, keep_from):
-        self.blocks = [
-            (start, block)
-            for start, block in self.blocks
-            if start + len(block) > keep_from
-        ]
-
-
-def process_audio_queue(audio_queue, is_recording, vad, vad_history, process_segments, block_size=BLOCK_SIZE):
-    audio_buffer = np.array([], dtype=np.float32)
-    chunk_count = 0
-
-    while is_recording() or not audio_queue.empty():
-        try:
-            chunk = audio_queue.get(timeout=0.1)
-        except queue.Empty:
-            continue
-
-        chunk_count += 1
-        if chunk_count == 1:
-            log.info("音声データ受信開始")
-        audio_buffer = np.concatenate([audio_buffer, chunk])
-
-        while len(audio_buffer) >= block_size:
-            block = audio_buffer[:block_size]
-            audio_buffer = audio_buffer[block_size:]
-
-            vad_history.accept_block(vad, block)
-            process_segments()
-
-    if len(audio_buffer) > 0:
-        padded = np.pad(audio_buffer, (0, block_size - len(audio_buffer)))
-        vad_history.accept_block(vad, padded)
-    vad.flush()
-    process_segments()
-    vad.reset()
-    vad_history.reset()
-
-
-def drain_vad_segments(
-    vad,
-    vad_history,
-    min_speech_duration,
-    pre_roll_duration,
-    on_segment,
-    sample_rate=SAMPLE_RATE,
-):
-    while not vad.empty():
-        segment = vad.front
-        segment_sample_count = len(segment.samples)
-        speech_samples = vad_history.segment_samples_with_preroll(
-            segment,
-            pre_roll_duration,
-            sample_rate=sample_rate,
-        )
-        vad.pop()
-        duration = len(speech_samples) / sample_rate
-        log.info("VAD検出: %.1f秒", duration)
-
-        if segment_sample_count < sample_rate * min_speech_duration:
-            log.info("最小発話長未満、スキップ")
-            continue
-
-        on_segment(speech_samples)
