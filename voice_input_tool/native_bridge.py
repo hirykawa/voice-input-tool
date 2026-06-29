@@ -69,6 +69,34 @@ def write_output(text, pid):
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def parse_command_line(line):
+    line = line.strip()
+    if not line:
+        return None
+
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return {"command": line, "target_pid": None}
+
+    if not isinstance(payload, dict):
+        return {"command": line, "target_pid": None}
+
+    command = str(payload.get("command", "")).strip()
+    if not command:
+        return None
+
+    target_pid = payload.get("target_pid")
+    try:
+        target_pid = int(target_pid)
+    except (TypeError, ValueError):
+        target_pid = None
+    if target_pid is not None and target_pid <= 0:
+        target_pid = None
+
+    return {"command": command, "target_pid": target_pid}
+
+
 class NativeCommandReader:
     def __init__(self, path=COMMAND_FILE_PATH):
         self.path = path

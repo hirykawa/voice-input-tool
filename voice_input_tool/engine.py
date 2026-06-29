@@ -36,12 +36,13 @@ from voice_input_tool.macos_text import (
     get_frontmost_application,
     insert_text_at_cursor,
     request_accessibility_permission,
-    target_pid,
+    target_pid as app_target_pid,
 )
 from voice_input_tool.native_bridge import (
     NativeCommandReader,
     ensure_bridge_files,
     native_paste_bridge_ready,
+    parse_command_line,
     write_output,
 )
 from voice_input_tool.notifications import notify_user
@@ -137,6 +138,7 @@ class VoiceInputApp(rumps.App):
         self._process_thread = None
         self._settings_ctrl = None
         self._target_app = None
+        self._target_pid = None
         self._status_controller = None
         self._has_audio_started = False
         self._start_requested_at = None
@@ -258,13 +260,13 @@ class VoiceInputApp(rumps.App):
         except Exception as e:
             log.error(f"ホットキー登録エラー: {e}")
 
-    def toggle_recording(self, sender=None):
+    def toggle_recording(self, sender=None, target_pid=None):
         if self.is_recording:
             self.stop_recording()
         else:
-            self.start_recording()
+            self.start_recording(target_pid=target_pid)
 
-    def start_recording(self):
+    def start_recording(self, target_pid=None):
         if self.is_recording:
             return
         if self._process_thread and self._process_thread.is_alive():
@@ -274,11 +276,12 @@ class VoiceInputApp(rumps.App):
         self.vad.reset()
         self._vad_history.reset()
         self._audio_activity.reset()
-        self._target_app = get_frontmost_application()
+        self._target_pid = target_pid if target_pid and target_pid > 0 else None
+        self._target_app = None if self._target_pid else get_frontmost_application()
         self._has_audio_started = False
         self._start_requested_at = time.time()
         self._set_status("starting")
-        log.info("録音開始要求")
+        log.info("録音開始要求: target_pid=%s", self._target_pid or app_target_pid(self._target_app))
 
         self.is_recording = True
         if not self._ensure_audio_stream():
@@ -331,9 +334,15 @@ class VoiceInputApp(rumps.App):
 
     def _process_vad_segments(self):
         target_app = self._target_app
+        target_pid = self._target_pid
 
         def submit_segment(speech_samples):
-            self._segment_executor.submit(self._handle_speech_segment, speech_samples, target_app)
+            self._segment_executor.submit(
+                self._handle_speech_segment,
+                speech_samples,
+                target_app,
+                target_pid,
+            )
 
         drain_vad_segments(
             self.vad,
@@ -343,7 +352,7 @@ class VoiceInputApp(rumps.App):
             submit_segment,
         )
 
-    def _handle_speech_segment(self, speech_samples, target_app):
+    def _handle_speech_segment(self, speech_samples, target_app, target_pid_value=None):
         try:
             self._set_status("processing")
             start = time.time()
@@ -361,7 +370,7 @@ class VoiceInputApp(rumps.App):
 
             if self._native_output:
                 self._set_status("inserting")
-                self._send_text_to_native_app(text, target_app)
+                self._send_text_to_native_app(text, target_app, target_pid_value)
                 if not native_paste_bridge_ready():
                     log.warning("ネイティブ貼り付け受信側が未起動のためPython側で貼り付けます")
                     inserted = insert_text_at_cursor(text, target_app)
@@ -394,8 +403,8 @@ class VoiceInputApp(rumps.App):
         finally:
             self._restore_recording_status()
 
-    def _send_text_to_native_app(self, text, target_app=None):
-        pid = target_pid(target_app)
+    def _send_text_to_native_app(self, text, target_app=None, target_pid_value=None):
+        pid = target_pid_value if target_pid_value and target_pid_value > 0 else app_target_pid(target_app)
 
         try:
             write_output(text, pid)
@@ -573,15 +582,17 @@ def run_headless_app(recognizer, vad, use_llm=False):
                 log.exception("コマンドファイルの読み込みに失敗しました")
                 continue
 
-            for command in commands:
-                command = command.strip()
-                if not command:
+            for command_line in commands:
+                parsed_command = parse_command_line(command_line)
+                if not parsed_command:
                     continue
-                log.info("コマンド受信: %s", command)
+                command = parsed_command["command"]
+                command_target_pid = parsed_command["target_pid"]
+                log.info("コマンド受信: %s target_pid=%s", command, command_target_pid)
                 if command == "toggle":
-                    app.toggle_recording()
+                    app.toggle_recording(target_pid=command_target_pid)
                 elif command == "start":
-                    app.start_recording()
+                    app.start_recording(target_pid=command_target_pid)
                 elif command == "stop":
                     app.stop_recording()
                 elif command == "toggle_llm":

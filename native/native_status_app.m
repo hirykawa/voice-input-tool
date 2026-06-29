@@ -33,6 +33,16 @@ static void NativeLog(NSString *message) {
     [handle closeFile];
 }
 
+static pid_t CurrentFrontmostApplicationPid(void) {
+    NSRunningApplication *frontmost = [[NSWorkspace sharedWorkspace] frontmostApplication];
+    if (!frontmost) {
+        return 0;
+    }
+
+    pid_t pid = [frontmost processIdentifier];
+    return pid == getpid() ? 0 : pid;
+}
+
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 @property(nonatomic, strong) NSStatusItem *statusItem;
 @property(nonatomic, strong) NSMenuItem *toggleItem;
@@ -48,11 +58,12 @@ static void NativeLog(NSString *message) {
 @property(nonatomic, assign) EventHotKeyRef hotKeyRef;
 @property(nonatomic, assign) EventHandlerRef hotKeyHandlerRef;
 - (void)toggleRecording:(id)sender;
+- (void)toggleRecordingForTargetPid:(pid_t)targetPid;
 @end
 
 static OSStatus HotKeyPressedHandler(EventHandlerCallRef nextHandler, EventRef event, void *userData) {
     AppDelegate *delegate = (__bridge AppDelegate *)userData;
-    [delegate toggleRecording:nil];
+    [delegate toggleRecordingForTargetPid:CurrentFrontmostApplicationPid()];
     return noErr;
 }
 
@@ -522,29 +533,55 @@ static OSStatus HotKeyPressedHandler(EventHandlerCallRef nextHandler, EventRef e
     NativeLog([NSString stringWithFormat:@"direct text sent: pid=%d length=%lu", pid, (unsigned long)[text length]]);
 }
 
-- (BOOL)sendCommand:(NSString *)command {
+- (BOOL)sendCommand:(NSString *)command targetPid:(pid_t)targetPid {
     NSFileHandle *handle = [self appendHandleForPath:CommandFilePath];
     if (!handle) {
         return NO;
     }
-    NSData *data = [[command stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+
+    NSMutableDictionary *payload = [@{
+        @"command": command,
+        @"created_at": @([[NSDate date] timeIntervalSince1970]),
+    } mutableCopy];
+    if (targetPid > 0) {
+        [payload setObject:@(targetPid) forKey:@"target_pid"];
+    }
+
+    NSError *error = nil;
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&error];
+    NSString *line = nil;
+    if (jsonData) {
+        line = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+    } else {
+        NativeLog([NSString stringWithFormat:@"command json failed: %@", error]);
+        line = command;
+    }
+    NSData *data = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
     [handle writeData:data];
     [handle closeFile];
     return YES;
 }
 
 - (void)toggleRecording:(id)sender {
-    NativeLog(@"toggleRecording");
+    [self toggleRecordingForTargetPid:CurrentFrontmostApplicationPid()];
+}
+
+- (void)toggleRecordingForTargetPid:(pid_t)targetPid {
+    NativeLog([NSString stringWithFormat:@"toggleRecording target_pid=%d", targetPid]);
     BOOL wasRunning = self.engineTask && self.engineTask.isRunning;
     [self startEngine];
     if (wasRunning) {
-        [self sendCommand:@"toggle"];
+        [self sendCommand:@"toggle" targetPid:targetPid];
         return;
     }
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self sendCommand:@"toggle"];
+        [self sendCommand:@"toggle" targetPid:targetPid];
     });
+}
+
+- (BOOL)sendCommand:(NSString *)command {
+    return [self sendCommand:command targetPid:0];
 }
 
 - (void)toggleLLM:(id)sender {
