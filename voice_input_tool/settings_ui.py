@@ -29,8 +29,8 @@ from Cocoa import (
     NSEventModifierFlagOption,
     NSEventModifierFlagCommand,
 )
-from audio_devices import list_input_devices
-from config import load_config, save_config
+from voice_input_tool.audio_devices import list_input_devices
+from voice_input_tool.config import load_config, save_config
 
 # pynput のキー名を表示用に変換
 DISPLAY_KEY_MAP = {
@@ -443,7 +443,7 @@ class SettingsWindowController(NSObject):
 
     @objc.typedSelector(b"v@:@")
     def resetClicked_(self, sender):
-        from config import DEFAULTS
+        from voice_input_tool.config import DEFAULTS
         self.llm_checkbox.setState_(NSControlStateValueOn if DEFAULTS["use_llm"] else NSControlStateValueOff)
         self.hotkey_record_field.setHotkeyValue_(DEFAULTS["hotkey_record"])
         self._populate_input_devices(DEFAULTS["input_device_id"])

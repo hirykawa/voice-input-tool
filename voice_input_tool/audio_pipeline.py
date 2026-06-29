@@ -6,7 +6,7 @@ import time
 
 import numpy as np
 
-from audio_constants import BLOCK_SIZE, SAMPLE_RATE
+from voice_input_tool.audio_constants import BLOCK_SIZE, SAMPLE_RATE
 
 log = logging.getLogger("voice_input")
 

@@ -3,7 +3,7 @@
 import logging
 import os
 
-from log_utils import mask_secret, safe_model_dump, truncate_for_log
+from voice_input_tool.log_utils import mask_secret, safe_model_dump, truncate_for_log
 
 log = logging.getLogger("voice_input")
 

@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-APP_DIR = Path(__file__).resolve().parent
+APP_DIR = Path(__file__).resolve().parent.parent
 
 LOG_DIR = Path.home() / "voice-input-tool" / "logs"
 MODEL_DIR = str(

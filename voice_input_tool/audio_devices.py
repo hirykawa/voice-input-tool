@@ -27,9 +27,30 @@ def list_input_devices():
 
 
 def _first_input_device():
-    for index, device in enumerate(sd.query_devices()):
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return None, None
+
+    for index, device in enumerate(devices):
         if int(device.get("max_input_channels", 0)) > 0:
             return index, device
+    return None, None
+
+
+def _default_input_device():
+    try:
+        default_input = sd.default.device[0]
+        if default_input is None or int(default_input) < 0:
+            return None, None
+
+        index = int(default_input)
+        device = sd.query_devices(index)
+        if int(device.get("max_input_channels", 0)) > 0:
+            return index, device
+    except Exception:
+        return None, None
+
     return None, None
 
 
@@ -37,11 +58,9 @@ def resolve_input_device(device_id):
     """Convert a saved device id into a sounddevice InputStream value."""
     try:
         if device_id in (None, ""):
-            default_input = sd.default.device[0]
-            if default_input is not None and int(default_input) >= 0:
-                device = sd.query_devices(int(default_input))
-                if int(device.get("max_input_channels", 0)) > 0:
-                    return int(default_input)
+            index, device = _default_input_device()
+            if device is not None:
+                return index
 
             index, device = _first_input_device()
             if device is not None:
@@ -62,6 +81,11 @@ def resolve_input_device(device_id):
         return index
     except Exception as e:
         log.error("入力マイク設定を使用できません: id=%s error=%s", device_id, e)
+        index, device = _default_input_device()
+        if device is not None:
+            log.warning("入力マイク設定の代わりに既定入力を使用します: %s", device.get("name", index))
+            return index
+
         index, device = _first_input_device()
         if device is not None:
             log.warning("入力マイク設定の代わりに別の入力を使用します: %s", device.get("name", index))

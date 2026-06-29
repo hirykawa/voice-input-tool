@@ -5,7 +5,7 @@ import logging
 import os
 import time
 
-from app_paths import (
+from voice_input_tool.app_paths import (
     COMMAND_FILE_PATH,
     NATIVE_PASTE_READY_PATH,
     OUTPUT_FILE_PATH,

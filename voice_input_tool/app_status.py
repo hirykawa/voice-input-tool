@@ -4,8 +4,8 @@ import logging
 import os
 import threading
 
-from app_paths import TYPING_INDICATOR_ICON_FRAMES
-from native_bridge import write_status
+from voice_input_tool.app_paths import TYPING_INDICATOR_ICON_FRAMES
+from voice_input_tool.native_bridge import write_status
 
 log = logging.getLogger("voice_input")
 

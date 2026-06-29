@@ -28,7 +28,7 @@ macOS 向けローカル音声入力ツールです。
 
 この手順は、他の社員が自分のMacで最短で使い始めるためのものです。
 
-> 重要: 現在の既定設定では、ツール本体・設定・モデルを `~/voice-input-tool` に置く前提です。別の場所に置く場合は、`voice_input.py` / `config.py` のパス設定も変更してください。
+> 重要: 現在の既定設定では、ツール本体・設定・モデルを `~/voice-input-tool` に置く前提です。別の場所に置く場合は、`voice_input.py` / `voice_input_tool/config.py` のパス設定も変更してください。
 
 ### 0. 事前に必要なもの
 
@@ -299,7 +299,7 @@ python voice_input.py --test --no-llm
 
 ## LLM設定
 
-既定値は `config.py` の `DEFAULTS` で管理しています。
+既定値は `voice_input_tool/config.py` の `DEFAULTS` で管理しています。
 
 | キー | 既定値 | 説明 |
 |------|--------|------|
@@ -360,17 +360,18 @@ tail -n 120 ~/voice-input-tool/logs/voice-input-error.log
 ## ファイル構成
 
 ```
-native_status_app.m - メニューバー常駐アプリ（録音操作・設定・自動入力）
-voice_input.py   - 音声入力エンジン（ASR/VAD/LLM）
-config.py        - 設定ファイル管理（config.json/.env の読み書き）
-settings_ui.py   - ネイティブmacOS設定画面（PyObjC）
-start.sh         - CLI起動用シェルスクリプト
-requirements.txt - Python依存パッケージ一覧
-assets/          - メニューバー用アイコン素材
-models/          - ASR・VADモデル（.gitignore済み）
-logs/            - ログファイル（.gitignore済み）
-config.json      - ユーザー設定（.gitignore済み）
-.env             - 環境変数（.gitignore済み）
+voice_input.py       - CLIエントリーポイント（互換用ラッパー）
+voice_input_tool/    - Python実装（engine/ASR/VAD/LLM/設定UI/ネイティブ連携）
+native/              - macOSネイティブ常駐アプリ/ランチャーのソース
+packaging/           - VoiceInputTool.app 用 Info.plist
+launch-agents/       - 自動起動用 LaunchAgent サンプル
+assets/              - メニューバー用アイコン素材
+start.sh             - CLI起動用シェルスクリプト
+requirements.txt     - Python依存パッケージ一覧
+models/              - ASR・VADモデル（.gitignore済み）
+logs/                - ログファイル（.gitignore済み）
+config.json          - ユーザー設定（.gitignore済み）
+.env                 - 環境変数（.gitignore済み）
 ```
 
 ## パフォーマンス

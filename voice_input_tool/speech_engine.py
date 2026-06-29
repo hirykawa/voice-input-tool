@@ -5,8 +5,8 @@ import sys
 
 import sherpa_onnx
 
-from app_paths import MODEL_DIR, VAD_MODEL
-from audio_constants import SAMPLE_RATE
+from voice_input_tool.app_paths import MODEL_DIR, VAD_MODEL
+from voice_input_tool.audio_constants import SAMPLE_RATE
 
 
 def create_recognizer(sample_rate=SAMPLE_RATE):
