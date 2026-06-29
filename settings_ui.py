@@ -11,6 +11,7 @@ from Cocoa import (
     NSSecureTextField,
     NSButton,
     NSButtonTypeSwitch,
+    NSPopUpButton,
     NSTextView,
     NSScrollView,
     NSFont,
@@ -28,6 +29,7 @@ from Cocoa import (
     NSEventModifierFlagOption,
     NSEventModifierFlagCommand,
 )
+from audio_devices import list_input_devices
 from config import load_config, save_config
 
 # pynput のキー名を表示用に変換
@@ -210,6 +212,7 @@ class HotkeyField(NSTextField):
             45: "n", 46: "m", 18: "1", 19: "2", 20: "3", 21: "4",
             23: "5", 22: "6", 26: "7", 28: "8", 25: "9", 29: "0",
             27: "-", 24: "=", 42: "\\", 43: ",", 47: ".", 44: "/", 50: "`",
+            94: "_",
         }
         keycode = int(event.keyCode())
         if keycode in key_map:
@@ -234,6 +237,7 @@ class SettingsWindowController(NSObject):
     vad_min_speech_slider = objc.ivar()
     vad_min_speech_label = objc.ivar()
     hotkey_record_field = objc.ivar()
+    input_device_popup = objc.ivar()
     prompt_textview = objc.ivar()
     on_save_callback = objc.ivar()
 
@@ -247,7 +251,7 @@ class SettingsWindowController(NSObject):
 
     def _build_window(self):
         config = load_config()
-        W, H = 500, 600
+        W, H = 500, 645
 
         self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(200, 200, W, H),
@@ -284,6 +288,16 @@ class SettingsWindowController(NSObject):
         self.hotkey_record_field.setHotkeyValue_(config.get("hotkey_record", "<ctrl>+<shift>+<space>"))
         content.addSubview_(self.hotkey_record_field)
         content.addSubview_(_hint_label("クリック後、Ctrl/Shift等とキーを押す", 380, y - 2))
+        y -= 45
+
+        # --- 入力マイク ---
+        content.addSubview_(_label("入力マイク", 20, y))
+        self.input_device_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            NSMakeRect(170, y - 3, 300, 26),
+            False,
+        )
+        self._populate_input_devices(config.get("input_device_id", ""))
+        content.addSubview_(self.input_device_popup)
         y -= 45
 
         # --- VAD Threshold ---
@@ -379,18 +393,45 @@ class SettingsWindowController(NSObject):
         elif tag == 3:
             self.vad_min_speech_label.setStringValue_(f"{sender.doubleValue():.1f}")
 
+    def _populate_input_devices(self, selected_device_id):
+        self.input_device_popup.removeAllItems()
+        self.input_device_popup.addItemWithTitle_("自動選択")
+        self.input_device_popup.itemAtIndex_(0).setRepresentedObject_("")
+
+        selected_index = 0
+        for device in list_input_devices():
+            self.input_device_popup.addItemWithTitle_(device["label"])
+            item_index = self.input_device_popup.numberOfItems() - 1
+            item = self.input_device_popup.itemAtIndex_(item_index)
+            item.setRepresentedObject_(device["id"])
+            if device["id"] == str(selected_device_id):
+                selected_index = item_index
+
+        if self.input_device_popup.numberOfItems() == 1:
+            self.input_device_popup.addItemWithTitle_("入力デバイスが見つかりません")
+            self.input_device_popup.itemAtIndex_(1).setRepresentedObject_("")
+            self.input_device_popup.setEnabled_(False)
+
+        self.input_device_popup.selectItemAtIndex_(selected_index)
+
     @objc.typedSelector(b"v@:@")
     def saveClicked_(self, sender):
+        config = load_config()
         hotkey_val = self.hotkey_record_field.getHotkeyValue()
-        config = {
+        input_device_id = ""
+        selected_device = self.input_device_popup.selectedItem()
+        if selected_device is not None and selected_device.representedObject() is not None:
+            input_device_id = str(selected_device.representedObject())
+        config.update({
             "use_llm": self.llm_checkbox.state() == NSControlStateValueOn,
             "openrouter_api_key": str(self.api_key_field.stringValue()),
             "hotkey_record": hotkey_val if hotkey_val else "<ctrl>+<shift>+<space>",
+            "input_device_id": input_device_id,
             "vad_threshold": round(self.vad_threshold_slider.doubleValue(), 2),
             "vad_silence_duration": round(self.vad_silence_slider.doubleValue(), 1),
             "vad_min_speech": round(self.vad_min_speech_slider.doubleValue(), 1),
             "llm_prompt": str(self.prompt_textview.string()),
-        }
+        })
         save_config(config)
         if self.on_save_callback:
             self.on_save_callback(config)
@@ -405,6 +446,7 @@ class SettingsWindowController(NSObject):
         from config import DEFAULTS
         self.llm_checkbox.setState_(NSControlStateValueOn if DEFAULTS["use_llm"] else NSControlStateValueOff)
         self.hotkey_record_field.setHotkeyValue_(DEFAULTS["hotkey_record"])
+        self._populate_input_devices(DEFAULTS["input_device_id"])
         self.vad_threshold_slider.setDoubleValue_(DEFAULTS["vad_threshold"])
         self.vad_threshold_label.setStringValue_(f"{DEFAULTS['vad_threshold']:.2f}")
         self.vad_silence_slider.setDoubleValue_(DEFAULTS["vad_silence_duration"])

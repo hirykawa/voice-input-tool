@@ -23,6 +23,7 @@ DEFAULTS = {
     "llm_model": "openai/gpt-oss-120b",
     "llm_provider_order": ["Cerebras"],
     "hotkey_record": "<ctrl>+<shift>+<space>",
+    "input_device_id": "",
     "llm_prompt": (
         "以下の音声認識結果に、句読点のみを挿入してください。\n"
         "文章の変更・言い換え・要約は一切しないでください。\n"

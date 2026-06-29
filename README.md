@@ -18,7 +18,7 @@ macOS 向けローカル音声入力ツールです。
   - provider: `Cerebras`
   - provider fallback: 無効
   - `data_collection: deny` / `zdr: true`
-- macOS メニューバーアプリ（rumps）として常駐
+- macOS メニューバーアプリとして常駐
 - ネイティブ設定画面（PyObjC）でGUIから設定変更可能
 - グローバルホットキー対応（設定画面でカスタマイズ可能）
 - 認識結果はカーソル位置に入力（貼り付け不可時は補正済みテキストをクリップボードに保持）
@@ -82,8 +82,8 @@ cd ~/voice-input-tool
 ```bash
 cd ~/voice-input-tool
 PYTHON_BIN="$(command -v python3.11 || command -v python3)"
-"$PYTHON_BIN" -m venv .venv
-source .venv/bin/activate
+"$PYTHON_BIN" -m venv .venv-framework
+source .venv-framework/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
@@ -92,7 +92,7 @@ python -m pip install -r requirements.txt
 
 ```bash
 cd ~/voice-input-tool
-source .venv/bin/activate
+source .venv-framework/bin/activate
 ```
 
 ### 3. 音声認識モデルをダウンロードする
@@ -144,8 +144,8 @@ LLM補正を使わない場合は、起動後にメニューバーの `LLM補正
 
 ```bash
 cd ~/voice-input-tool
-source .venv/bin/activate
-python voice_input.py --test
+source .venv-framework/bin/activate
+python voice_input.py --test --no-llm
 ```
 
 ASRのテスト結果が表示されれば、Python依存関係とモデル配置は正常です。
@@ -160,7 +160,7 @@ chmod +x start.sh
 ./start.sh
 ```
 
-起動すると、メニューバーに 🎙 アイコンが表示されます。終了するまでターミナルは閉じないでください。
+起動すると、メニューバーに 🎙 アイコンが表示されます。`~/Applications/VoiceInputTool.app` がある場合は、`./start.sh` からそのアプリを起動します。
 
 設定でLLM補正をOFFにした後、一時的にLLM補正ONで起動したい場合は次を使います。
 
@@ -174,16 +174,16 @@ chmod +x start.sh
 
 | 権限 | 用途 | 許可する対象 |
 |------|------|--------------|
-| マイク | 音声入力 | ターミナル / iTerm / `Voice Input Tool.app` |
-| アクセシビリティ | ホットキー、カーソル位置への入力 | ターミナル / iTerm / `Voice Input Tool.app` |
-| 入力監視 | ホットキーが反応しない場合に必要なことがあります | ターミナル / iTerm / `Voice Input Tool.app` |
+| マイク | 音声入力 | `VoiceInputTool.app` / ターミナル / iTerm |
+| アクセシビリティ | ホットキー、カーソル位置への入力 | `VoiceInputTool.app` / ターミナル / iTerm |
+| 入力監視 | ホットキーが反応しない場合に必要なことがあります | `VoiceInputTool.app` / ターミナル / iTerm |
 
 設定場所:
 
 1. macOSの「システム設定」を開く
 2. 「プライバシーとセキュリティ」を開く
 3. 「マイク」「アクセシビリティ」「入力監視」を確認
-4. 起動に使っているアプリ（Terminal、iTerm、または `Voice Input Tool.app`）を許可
+4. 起動に使っているアプリ（`VoiceInputTool.app`、Terminal、iTermなど）を許可
 5. 権限を変更したら、Voice Input Toolを一度終了して再起動
 
 ### 8. 動作確認
@@ -195,25 +195,11 @@ chmod +x start.sh
 5. 少し無音にすると、認識・補正後のテキストがカーソル位置に入力される
 6. 終了するときは、もう一度 `Ctrl+Shift+Space` を押す、またはメニューから停止する
 
-### 9. 任意: ダブルクリックで起動できるアプリにする
+### 9. ダブルクリックで起動する
 
-ターミナル起動が面倒な場合は、Automatorで簡易アプリを作れます。
+同梱のネイティブアプリを `~/Applications/VoiceInputTool.app` に配置すると、Finderからダブルクリックで起動できます。デスクトップにある `VoiceInputTool.app` は、このアプリへのショートカットです。
 
-1. macOSの「Automator」を開く
-2. 「新規書類」→「アプリケーション」を選ぶ
-3. アクション「シェルスクリプトを実行」を追加
-4. シェルを `/bin/bash` にして、以下を貼り付ける
-
-```bash
-cd "$HOME/voice-input-tool"
-exec "$HOME/voice-input-tool/start.sh"
-```
-
-5. `~/Applications/Voice Input Tool.app` として保存（`~/Applications` がなければ作成）
-6. 次回からこのアプリをダブルクリックして起動
-7. 権限設定では、Terminalではなく `Voice Input Tool.app` を許可
-
-ログイン時に自動起動したい場合は、macOSの「システム設定」→「一般」→「ログイン項目」に `Voice Input Tool.app` を追加してください。
+ログイン時に自動起動したい場合は、macOSの「システム設定」→「一般」→「ログイン項目」に `VoiceInputTool.app` を追加してください。
 
 ### 10. 更新手順
 
@@ -222,7 +208,7 @@ exec "$HOME/voice-input-tool/start.sh"
 ```bash
 cd ~/voice-input-tool
 git pull
-source .venv/bin/activate
+source .venv-framework/bin/activate
 python -m pip install -r requirements.txt --upgrade
 ```
 
@@ -238,6 +224,7 @@ python -m pip install -r requirements.txt --upgrade
 |-------------|------|
 | 録音開始/停止 | 録音をトグル |
 | LLM補正: ON/OFF | LLM補正の有効/無効を切替 |
+| アクセシビリティ許可を確認 | 自動入力に必要なmacOS権限を確認 |
 | 設定... | 設定画面を開く |
 | 終了 | アプリを終了 |
 
@@ -245,13 +232,13 @@ python -m pip install -r requirements.txt --upgrade
 
 ```bash
 cd ~/voice-input-tool
-source .venv/bin/activate
+source .venv-framework/bin/activate
 
 # メニューバーアプリとして起動
 ./start.sh
 
-# テストモード（WAVファイルで動作確認）
-python voice_input.py --test
+# テストモード（WAVファイルでASR動作確認）
+python voice_input.py --test --no-llm
 ```
 
 ### ホットキー
@@ -302,6 +289,7 @@ python voice_input.py --test
 | LLM 句読点補正 | ON/OFF切替 | ON |
 | OpenRouter API Key | LLM補正用APIキー | `.env` から読み込み |
 | 録音 開始/停止 | ホットキー設定 | Ctrl+Shift+Space |
+| 入力マイク | 使用するマイク。未選択時はシステムの既定入力 | 自動選択 |
 | VAD 発話検出閾値 | 発話と判定する閾値 (0.1-0.9) | 0.5 |
 | 無音判定時間 | 発話終了と判断する無音の長さ (0.2-3.0秒) | 0.8秒 |
 | 最小発話長 | 認識対象とする最短の発話長 (0.1-2.0秒) | 0.3秒 |
@@ -361,9 +349,9 @@ tail -n 120 ~/voice-input-tool/logs/voice-input-error.log
 
 | 症状 | 確認すること |
 |------|--------------|
-| `ModuleNotFoundError` が出る | `cd ~/voice-input-tool` → `source .venv/bin/activate` → `python -m pip install -r requirements.txt` を再実行 |
+| `ModuleNotFoundError` が出る | `cd ~/voice-input-tool` → `source .venv-framework/bin/activate` → `python -m pip install -r requirements.txt` を再実行 |
 | `モデルファイルが見つかりません` と出る | `models/` 配下に ASRモデル展開済みフォルダと `silero_vad.onnx` があるか確認 |
-| メニューバーに何も出ない | ターミナルにエラーが出ていないか確認。`logs/voice-input-error.log` も確認 |
+| メニューバーに何も出ない | `~/Applications/VoiceInputTool.app` を起動しているか確認。`logs/native-status.log` と `logs/native-engine.err.log` も確認 |
 | マイク入力できない | macOSの「マイク」権限で、起動に使っているアプリを許可して再起動 |
 | `Ctrl+Shift+Space` が効かない | 「アクセシビリティ」と、必要に応じて「入力監視」を許可して再起動。別アプリのショートカットと衝突していないかも確認 |
 | カーソル位置に入力されない | 「アクセシビリティ」権限を確認。貼り付け不可のアプリではクリップボードに残ります |
@@ -372,7 +360,8 @@ tail -n 120 ~/voice-input-tool/logs/voice-input-error.log
 ## ファイル構成
 
 ```
-voice_input.py   - メインアプリ（ASR/VAD/LLM/メニューバー）
+native_status_app.m - メニューバー常駐アプリ（録音操作・設定・自動入力）
+voice_input.py   - 音声入力エンジン（ASR/VAD/LLM）
 config.py        - 設定ファイル管理（config.json/.env の読み書き）
 settings_ui.py   - ネイティブmacOS設定画面（PyObjC）
 start.sh         - CLI起動用シェルスクリプト
