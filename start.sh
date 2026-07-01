@@ -1,5 +1,5 @@
 #!/bin/bash
-cd ~/voice-input-tool
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 APP_LAUNCHER="$HOME/Applications/VoiceInputTool.app/Contents/MacOS/VoiceInputTool"
 if [ -x "$APP_LAUNCHER" ] && [ $# -eq 0 ]; then
