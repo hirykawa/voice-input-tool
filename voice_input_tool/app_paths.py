@@ -4,13 +4,13 @@ from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent.parent
 
-LOG_DIR = Path.home() / "voice-input-tool" / "logs"
+LOG_DIR = APP_DIR / "logs"
 MODEL_DIR = str(
-    Path.home()
-    / "voice-input-tool"
+    APP_DIR
     / "models"
     / "sherpa-onnx-zipformer-ja-reazonspeech-2024-08-01"
 )
+VAD_MODEL_PATH = str(APP_DIR / "models" / "silero_vad.onnx")
 
 RUNTIME_DIR = APP_DIR / "logs"
 COMMAND_FILE_PATH = str(RUNTIME_DIR / "voice-input-command.txt")

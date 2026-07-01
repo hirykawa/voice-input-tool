@@ -8,7 +8,9 @@ Mac Mini (Apple Silicon) 向け ローカル音声入力ツール
 """
 
 import argparse
+import collections
 import os
+import queue
 import signal
 import sys
 import time
@@ -19,7 +21,6 @@ import logging
 from voice_input_tool.app_paths import LOG_DIR, MODEL_DIR
 from voice_input_tool.audio_constants import BLOCK_SIZE, CHANNELS, SAMPLE_RATE
 from voice_input_tool.audio_devices import resolve_input_device
-from voice_input_tool.audio_pipeline import AudioActivityTracker
 from voice_input_tool.app_status import AppStatusController
 from voice_input_tool.config import load_config, save_config
 from voice_input_tool.llm_correction import configure_llm, llm_correct
@@ -39,7 +40,7 @@ from voice_input_tool.native_bridge import (
     write_output,
 )
 from voice_input_tool.notifications import notify_user
-from voice_input_tool.speech_engine import create_recognizer, recognize_speech
+from voice_input_tool.speech_engine import create_recognizer, create_vad, recognize_speech
 from voice_input_tool.status_bar_diagnostics import install_status_bar_diagnostics
 
 # ファイルログ設定
@@ -95,6 +96,30 @@ configure_llm(APP_CONFIG)
 # メニューバーアプリ
 # ============================================================
 
+# VAD（Silero VAD）が検出した区間がこの秒数未満ならノイズとみなして捨てる
+MIN_SEGMENT_SECONDS = 0.3
+# VADは発話開始の確定に少しラグがあり、区間の先頭が欠けることがあるため、
+# 直前この秒数分の音声を保持しておき、発話開始と判定された瞬間に先頭へ差し込む。
+# min_silence_duration（VAD側の無音判定に必要な秒数）より短くし、
+# 直前の発話の末尾を誤って混入させないようにする
+PREROLL_SECONDS = 0.3
+PREROLL_BLOCKS = max(1, int(PREROLL_SECONDS * SAMPLE_RATE / BLOCK_SIZE))
+# 区間の先頭・末尾が急に始まる/終わることでクリックノイズが乗り、
+# ASRが余分な子音を誤認識することがあるため、短いフェードをかける
+FADE_SECONDS = 0.01
+FADE_SAMPLES = max(1, int(FADE_SECONDS * SAMPLE_RATE))
+
+
+def _apply_fade(samples):
+    if len(samples) < FADE_SAMPLES * 2:
+        return samples
+    samples = samples.copy()
+    ramp = np.linspace(0.0, 1.0, FADE_SAMPLES, dtype=np.float32)
+    samples[:FADE_SAMPLES] *= ramp
+    samples[-FADE_SAMPLES:] *= ramp[::-1]
+    return samples
+
+
 class _HeadlessMenuItem:
     def __init__(self, title=""):
         self.title = title
@@ -115,20 +140,31 @@ class VoiceInputApp(rumps.App):
             self.title = "VI"
             self.icon = None
         self.recognizer = recognizer
+        self.vad = None
         self.use_llm = use_llm
         self.is_recording = False
         self._stream = None
-        self._process_thread = None
         self._settings_ctrl = None
         self._target_app = None
         self._target_pid = None
         self._status_controller = None
         self._has_audio_started = False
+        self._had_any_segment = False
+        self._is_speech_active = False
         self._start_requested_at = None
-        self._audio_activity = AudioActivityTracker()
-        self._recorded_chunks = []
-        self._recording_lock = threading.Lock()
         self._recognizer_lock = threading.Lock()
+        self._vad_init_lock = threading.Lock()
+        # VAD（発話区間の検出）へのアクセスは録音スレッドと停止操作のスレッドの
+        # 両方から行われるため、内部状態の破壊を避けるために排他制御する
+        self._vad_lock = threading.Lock()
+        # 発話開始の頭欠けを防ぐための直前音声バッファと、区間ごとの前置き待ち行列
+        self._preroll = collections.deque(maxlen=PREROLL_BLOCKS)
+        self._pending_prefixes = collections.deque()
+        self._segment_queue = queue.Queue()
+        self._segment_worker_thread = threading.Thread(
+            target=self._segment_worker_loop, daemon=True
+        )
+        self._segment_worker_thread.start()
 
         self._hotkey_listener = None
 
@@ -185,6 +221,20 @@ class VoiceInputApp(rumps.App):
         from voice_input_tool.settings_ui import hotkey_to_display
         hotkey = APP_CONFIG.get("hotkey_record", "<ctrl>+<shift>+<space>")
         return hotkey_to_display(hotkey)
+
+    def _ensure_vad(self):
+        if self.vad is not None:
+            return self.vad
+
+        with self._vad_init_lock:
+            if self.vad is not None:
+                return self.vad
+
+            log.info("VADモデル読み込み開始")
+            start = time.time()
+            self.vad = create_vad()
+            log.info("VADモデル読み込み完了 (%.1fs)", time.time() - start)
+            return self.vad
 
     def _ensure_audio_stream(self):
         if self._stream is not None:
@@ -253,12 +303,13 @@ class VoiceInputApp(rumps.App):
     def start_recording(self, target_pid=None):
         if self.is_recording:
             return
-        if self._process_thread and self._process_thread.is_alive():
-            log.info("前回の音声処理中のため録音開始をスキップ")
-            return
-        self._audio_activity.reset()
-        with self._recording_lock:
-            self._recorded_chunks = []
+        vad = self._ensure_vad()
+        with self._vad_lock:
+            vad.reset()
+            self._preroll.clear()
+            self._pending_prefixes.clear()
+        self._is_speech_active = False
+        self._had_any_segment = False
         self._target_pid = target_pid if target_pid and target_pid > 0 else None
         self._target_app = None if self._target_pid else get_frontmost_application()
         self._has_audio_started = False
@@ -277,40 +328,26 @@ class VoiceInputApp(rumps.App):
     def stop_recording(self):
         if not self.is_recording:
             return
-        with self._recording_lock:
-            self.is_recording = False
-            recorded_chunks = self._recorded_chunks
-            self._recorded_chunks = []
+        self.is_recording = False
+        self._has_audio_started = False
+        self._start_requested_at = None
 
         target_app = self._target_app
         target_pid = self._target_pid
-        self._has_audio_started = False
-        self._start_requested_at = None
-        self._audio_activity.reset()
+        with self._vad_lock:
+            self.vad.flush()
+            self._drain_vad_segments_locked(target_app, target_pid, is_final=True)
 
-        if not recorded_chunks:
-            self._set_status("idle")
+        if not self._had_any_segment:
             log.info("録音停止: 音声データなし")
-            return
-
-        duration = sum(len(chunk) for chunk in recorded_chunks) / SAMPLE_RATE
-        log.info("録音停止: %.1f秒 target_pid=%s", duration, target_pid or app_target_pid(target_app))
-        self._set_status("processing")
-        self._process_thread = threading.Thread(
-            target=self._process_recording_after_stop,
-            args=(recorded_chunks, target_app, target_pid),
-            daemon=True,
-        )
-        self._process_thread.start()
+        self._set_status("idle")
 
     def _audio_callback(self, indata, frames, time_info, status):
         if status:
             log.warning(f"オーディオステータス: {status}")
+        if not self.is_recording:
+            return
         samples = indata[:, 0].astype(np.float32)
-        with self._recording_lock:
-            if not self.is_recording:
-                return
-            self._recorded_chunks.append(samples.copy())
 
         if not self._has_audio_started:
             self._has_audio_started = True
@@ -319,16 +356,49 @@ class VoiceInputApp(rumps.App):
                 log.info(f"入力待機開始 ({elapsed:.2f}s)")
             self._set_status("listening")
             log.info("音声データ受信開始")
-        self._update_live_audio_status(samples)
 
-    def _update_live_audio_status(self, samples):
-        new_status = self._audio_activity.status_for_samples(samples, self._current_status())
-        if new_status is not None:
-            self._set_status(new_status)
+        with self._vad_lock:
+            was_speech = self.vad.is_speech_detected()
+            self.vad.accept_waveform(samples)
+            is_speech = self.vad.is_speech_detected()
+            if is_speech and not was_speech:
+                # 発話開始を検知。直前に貯めていた音声をこの区間の前置きとして予約する
+                if self._preroll:
+                    self._pending_prefixes.append(np.concatenate(list(self._preroll)))
+                else:
+                    self._pending_prefixes.append(np.array([], dtype=np.float32))
+            self._preroll.append(samples.copy())
+            if is_speech != self._is_speech_active:
+                self._is_speech_active = is_speech
+                self._set_status("hearing" if is_speech else "listening")
+            self._drain_vad_segments_locked(self._target_app, self._target_pid)
 
-    def _process_recording_after_stop(self, recorded_chunks, target_app, target_pid):
-        speech_samples = np.concatenate(recorded_chunks).astype(np.float32, copy=False)
-        self._handle_speech_segment(speech_samples, target_app, target_pid)
+    def _drain_vad_segments_locked(self, target_app, target_pid, is_final=False):
+        """VAD が確定させた発話区間をすべて取り出してキューへ渡す。
+
+        呼び出し元で self._vad_lock を保持していること。
+        """
+        while not self.vad.empty():
+            # front は参照であり、pop() を呼ぶと無効になるため、
+            # pop() より前に samples を取り出しておく必要がある
+            samples = np.asarray(self.vad.front.samples, dtype=np.float32)
+            self.vad.pop()
+            if self._pending_prefixes:
+                prefix = self._pending_prefixes.popleft()
+                if len(prefix):
+                    samples = np.concatenate([prefix, samples])
+            duration = len(samples) / SAMPLE_RATE
+            if duration < MIN_SEGMENT_SECONDS:
+                continue
+            self._had_any_segment = True
+            label = "録音停止: 最終区間" if is_final else "発話区切りを検出"
+            log.info("%s: %.1f秒 target_pid=%s", label, duration, target_pid or app_target_pid(target_app))
+            self._segment_queue.put((_apply_fade(samples), target_app, target_pid))
+
+    def _segment_worker_loop(self):
+        while True:
+            samples, target_app, target_pid = self._segment_queue.get()
+            self._handle_speech_segment(samples, target_app, target_pid)
 
     def _ensure_recognizer(self):
         if self.recognizer is not None:

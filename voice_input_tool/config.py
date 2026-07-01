@@ -9,7 +9,9 @@ import json
 import os
 from typing import Dict
 
-CONFIG_DIR = os.path.expanduser("~/voice-input-tool")
+from voice_input_tool.app_paths import APP_DIR
+
+CONFIG_DIR = str(APP_DIR)
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 DOTENV_PATH = os.path.join(CONFIG_DIR, ".env")
 
