@@ -22,7 +22,7 @@ from voice_input_tool.app_paths import LOG_DIR, MODEL_DIR
 from voice_input_tool.audio_constants import BLOCK_SIZE, CHANNELS, SAMPLE_RATE
 from voice_input_tool.audio_devices import resolve_input_device
 from voice_input_tool.app_status import AppStatusController
-from voice_input_tool.config import load_config, save_config
+from voice_input_tool.config import DEFAULTS, load_config, save_config
 from voice_input_tool.llm_correction import configure_llm, llm_correct
 from voice_input_tool.log_utils import truncate_for_log
 from voice_input_tool.macos_text import (
@@ -40,7 +40,12 @@ from voice_input_tool.native_bridge import (
     write_output,
 )
 from voice_input_tool.notifications import notify_user
-from voice_input_tool.speech_engine import create_recognizer, create_vad, recognize_speech
+from voice_input_tool.speech_engine import (
+    VAD_MAX_SPEECH_SECONDS,
+    create_recognizer,
+    create_vad,
+    recognize_speech,
+)
 from voice_input_tool.status_bar_diagnostics import install_status_bar_diagnostics
 
 # ファイルログ設定
@@ -98,12 +103,18 @@ configure_llm(APP_CONFIG)
 
 # VAD（Silero VAD）が検出した区間がこの秒数未満ならノイズとみなして捨てる
 MIN_SEGMENT_SECONDS = 0.3
-# VADは発話開始の確定に少しラグがあり、区間の先頭が欠けることがあるため、
-# 直前この秒数分の音声を保持しておき、発話開始と判定された瞬間に先頭へ差し込む。
-# min_silence_duration（VAD側の無音判定に必要な秒数）より短くし、
-# 直前の発話の末尾を誤って混入させないようにする
-PREROLL_SECONDS = 0.3
-PREROLL_BLOCKS = max(1, int(PREROLL_SECONDS * SAMPLE_RATE / BLOCK_SIZE))
+# VADが返す区間の開始位置（front.start）は実測では実際の発話開始の±0.05秒程度に
+# 収まるが、静かに話し始めた場合はさらに手前から声が出ていることがある
+# （テスト音源で最大0.3秒強）。そのため区間の直前この秒数分を履歴バッファから
+# 取り出して先頭に足す。直前の区間の末尾を越えては足さないので、
+# 前の発話の音声が混入することはない
+SEGMENT_HEAD_PAD_SECONDS = 0.35
+HEAD_PAD_SAMPLES = int(SEGMENT_HEAD_PAD_SECONDS * SAMPLE_RATE)
+# 履歴バッファの長さ。区間は最長 VAD_MAX_SPEECH_SECONDS 話し続けてから
+# 確定することがあるため、確定時点から「区間開始のさらに手前」まで
+# さかのぼって取り出せるだけの余裕を持たせる
+HISTORY_SECONDS = VAD_MAX_SPEECH_SECONDS + 4.0
+HISTORY_SAMPLES = int(HISTORY_SECONDS * SAMPLE_RATE)
 # 区間の先頭・末尾が急に始まる/終わることでクリックノイズが乗り、
 # ASRが余分な子音を誤認識することがあるため、短いフェードをかける
 FADE_SECONDS = 0.01
@@ -130,11 +141,13 @@ class VoiceInputApp(rumps.App):
         self._headless = headless
         self._native_output = native_output
         if not headless:
+            # 終了時に録音停止やステータスファイルの後始末を行うため、
+            # rumps標準の終了ボタンではなく自前のメニュー項目（quit_app）を使う
             super().__init__(
                 "Voice Input",
                 icon=None,
                 title="🎙",
-                quit_button="終了",
+                quit_button=None,
             )
         else:
             self.title = "VI"
@@ -154,19 +167,32 @@ class VoiceInputApp(rumps.App):
         self._start_requested_at = None
         self._recognizer_lock = threading.Lock()
         self._vad_init_lock = threading.Lock()
+        # 録音の開始/停止はホットキー（pynputスレッド）・メニュー（メインスレッド）・
+        # ヘッドレスコマンドの複数経路から呼ばれるため、状態遷移を排他制御する。
+        # toggle -> start/stop と入れ子で取得するので再入可能ロックにする
+        self._recording_lock = threading.RLock()
         # VAD（発話区間の検出）へのアクセスは録音スレッドと停止操作のスレッドの
         # 両方から行われるため、内部状態の破壊を避けるために排他制御する
         self._vad_lock = threading.Lock()
-        # 発話開始の頭欠けを防ぐための直前音声バッファと、区間ごとの前置き待ち行列
-        self._preroll = collections.deque(maxlen=PREROLL_BLOCKS)
-        self._pending_prefixes = collections.deque()
+        # 発話区間の頭欠けを防ぐため、VADへ渡した音声の履歴を
+        # (開始サンプル位置, サンプル列) の組で保持する（_vad_lockで保護）
+        self._history = collections.deque()
+        self._vad_samples_fed = 0
+        self._last_segment_end = 0
         self._segment_queue = queue.Queue()
         self._segment_worker_thread = threading.Thread(
             target=self._segment_worker_loop, daemon=True
         )
         self._segment_worker_thread.start()
 
+        # pynputのmacOSリスナーはスレッド起動のたびにTSM（テキスト入力管理）へ
+        # アクセスしており、繰り返し起動し直すとネイティブクラッシュ
+        # （dispatch_assert_queue_fail）を引き起こすため、リスナースレッド自体は
+        # アプリ起動時に一度だけ作成し、以後はホットキーの組み合わせ判定
+        # （HotKeyオブジェクト、スレッドを伴わない）だけを差し替える
         self._hotkey_listener = None
+        self._hotkey = None
+        self._hotkey_lock = threading.Lock()
 
         # メニュー構成
         hotkey_display = self._get_hotkey_display()
@@ -187,6 +213,8 @@ class VoiceInputApp(rumps.App):
                 None,
                 self.llm_status,
                 self.settings_button,
+                None,
+                rumps.MenuItem("終了", callback=self.quit_app),
             ]
 
         call_after = AppHelper.callAfter if HAS_APP_HELPER else None
@@ -204,6 +232,18 @@ class VoiceInputApp(rumps.App):
         # ホットキー登録
         self._register_hotkey()
 
+        # 初回録音時にモデル読み込みでマイク起動が遅れ、話し始めが丸ごと
+        # 失われるのを防ぐため、モデルはバックグラウンドで先に読み込んでおく
+        threading.Thread(target=self._preload_models, daemon=True).start()
+
+    def _preload_models(self):
+        try:
+            self._ensure_vad()
+            self._ensure_recognizer()
+        except BaseException:
+            # モデルファイル欠如時に create_* が SystemExit を投げるため、それも拾う
+            log.exception("モデルの事前読み込みに失敗しました")
+
     def _set_status(self, status, force=False):
         self._status_controller.set(status, force=force)
 
@@ -214,7 +254,9 @@ class VoiceInputApp(rumps.App):
         return self._status_controller.current()
 
     def _restore_recording_status(self):
-        self._status_controller.restore_recording_status(self.is_recording)
+        self._status_controller.restore_recording_status(
+            self.is_recording, self._is_speech_active
+        )
 
     def _get_hotkey_display(self):
         """設定からホットキーの表示文字列を取得"""
@@ -272,75 +314,116 @@ class VoiceInputApp(rumps.App):
                 self._stream = None
 
     def _register_hotkey(self):
-        """グローバルホットキーを登録"""
+        """設定されたホットキーの組み合わせを反映する。
+
+        listenerスレッド自体は最初に一度だけ起動し、以後は使い回す。
+        ホットキーの変更時は、判定に使う HotKey オブジェクト（スレッドを
+        伴わない軽量な状態機械）だけを差し替える。
+        """
         if not HAS_HOTKEY:
             log.warning("pynput未インストール: ホットキー無効")
             return
-
-        # 既存のリスナーを停止
-        if self._hotkey_listener:
-            self._hotkey_listener.stop()
-            self._hotkey_listener = None
 
         hotkey = APP_CONFIG.get("hotkey_record", "<ctrl>+<shift>+<space>")
         log.info(f"ホットキー登録: {hotkey}")
 
         try:
-            self._hotkey_listener = keyboard.GlobalHotKeys({
-                hotkey: self.toggle_recording,
-            })
-            self._hotkey_listener.daemon = True
-            self._hotkey_listener.start()
+            new_hotkey = keyboard.HotKey(keyboard.HotKey.parse(hotkey), self.toggle_recording)
         except Exception as e:
+            # 設定に解析できないホットキーが残っていてもアプリを操作不能に
+            # しないよう、デフォルトのホットキーへフォールバックする
             log.error(f"ホットキー登録エラー: {e}")
+            fallback = DEFAULTS["hotkey_record"]
+            if hotkey == fallback:
+                return
+            try:
+                new_hotkey = keyboard.HotKey(keyboard.HotKey.parse(fallback), self.toggle_recording)
+                log.warning(f"デフォルトのホットキーを使用します: {fallback}")
+            except Exception as fallback_error:
+                log.error(f"デフォルトホットキーの登録にも失敗しました: {fallback_error}")
+                return
+
+        with self._hotkey_lock:
+            self._hotkey = new_hotkey
+
+        if self._hotkey_listener is None:
+            try:
+                self._hotkey_listener = keyboard.Listener(
+                    on_press=self._on_hotkey_press,
+                    on_release=self._on_hotkey_release,
+                )
+                self._hotkey_listener.daemon = True
+                self._hotkey_listener.start()
+            except Exception as e:
+                log.error(f"ホットキーリスナー起動エラー: {e}")
+
+    def _on_hotkey_press(self, key, injected=False):
+        if injected:
+            return
+        with self._hotkey_lock:
+            hotkey = self._hotkey
+        if hotkey is not None:
+            hotkey.press(self._hotkey_listener.canonical(key))
+
+    def _on_hotkey_release(self, key, injected=False):
+        if injected:
+            return
+        with self._hotkey_lock:
+            hotkey = self._hotkey
+        if hotkey is not None:
+            hotkey.release(self._hotkey_listener.canonical(key))
 
     def toggle_recording(self, sender=None, target_pid=None):
-        if self.is_recording:
-            self.stop_recording()
-        else:
-            self.start_recording(target_pid=target_pid)
+        with self._recording_lock:
+            if self.is_recording:
+                self.stop_recording()
+            else:
+                self.start_recording(target_pid=target_pid)
 
     def start_recording(self, target_pid=None):
-        if self.is_recording:
-            return
-        vad = self._ensure_vad()
-        with self._vad_lock:
-            vad.reset()
-            self._preroll.clear()
-            self._pending_prefixes.clear()
-        self._is_speech_active = False
-        self._had_any_segment = False
-        self._target_pid = target_pid if target_pid and target_pid > 0 else None
-        self._target_app = None if self._target_pid else get_frontmost_application()
-        self._has_audio_started = False
-        self._start_requested_at = time.time()
-        self._set_status("starting")
-        log.info("録音開始要求: target_pid=%s", self._target_pid or app_target_pid(self._target_app))
+        with self._recording_lock:
+            if self.is_recording:
+                return
+            vad = self._ensure_vad()
+            with self._vad_lock:
+                vad.reset()
+                self._history.clear()
+                self._vad_samples_fed = 0
+                self._last_segment_end = 0
+            self._is_speech_active = False
+            self._had_any_segment = False
+            self._target_pid = target_pid if target_pid and target_pid > 0 else None
+            self._target_app = None if self._target_pid else get_frontmost_application()
+            self._has_audio_started = False
+            self._start_requested_at = time.time()
+            self._set_status("starting")
+            log.info("録音開始要求: target_pid=%s", self._target_pid or app_target_pid(self._target_app))
 
-        self.is_recording = True
-        if not self._ensure_audio_stream():
+            self.is_recording = True
+            if not self._ensure_audio_stream():
+                self.is_recording = False
+                self._has_audio_started = False
+                self._start_requested_at = None
+                self._set_status("idle")
+                return
+
+    def stop_recording(self):
+        with self._recording_lock:
+            if not self.is_recording:
+                return
             self.is_recording = False
             self._has_audio_started = False
             self._start_requested_at = None
+
+            target_app = self._target_app
+            target_pid = self._target_pid
+            with self._vad_lock:
+                self.vad.flush()
+                self._drain_vad_segments_locked(target_app, target_pid, is_final=True)
+
+            if not self._had_any_segment:
+                log.info("録音停止: 音声データなし")
             self._set_status("idle")
-            return
-
-    def stop_recording(self):
-        if not self.is_recording:
-            return
-        self.is_recording = False
-        self._has_audio_started = False
-        self._start_requested_at = None
-
-        target_app = self._target_app
-        target_pid = self._target_pid
-        with self._vad_lock:
-            self.vad.flush()
-            self._drain_vad_segments_locked(target_app, target_pid, is_final=True)
-
-        if not self._had_any_segment:
-            log.info("録音停止: 音声データなし")
-        self._set_status("idle")
 
     def _audio_callback(self, indata, frames, time_info, status):
         if status:
@@ -358,16 +441,16 @@ class VoiceInputApp(rumps.App):
             log.info("音声データ受信開始")
 
         with self._vad_lock:
-            was_speech = self.vad.is_speech_detected()
             self.vad.accept_waveform(samples)
+            self._history.append((self._vad_samples_fed, samples))
+            self._vad_samples_fed += len(samples)
+            while (
+                self._history
+                and self._history[0][0] + len(self._history[0][1])
+                < self._vad_samples_fed - HISTORY_SAMPLES
+            ):
+                self._history.popleft()
             is_speech = self.vad.is_speech_detected()
-            if is_speech and not was_speech:
-                # 発話開始を検知。直前に貯めていた音声をこの区間の前置きとして予約する
-                if self._preroll:
-                    self._pending_prefixes.append(np.concatenate(list(self._preroll)))
-                else:
-                    self._pending_prefixes.append(np.array([], dtype=np.float32))
-            self._preroll.append(samples.copy())
             if is_speech != self._is_speech_active:
                 self._is_speech_active = is_speech
                 self._set_status("hearing" if is_speech else "listening")
@@ -380,13 +463,17 @@ class VoiceInputApp(rumps.App):
         """
         while not self.vad.empty():
             # front は参照であり、pop() を呼ぶと無効になるため、
-            # pop() より前に samples を取り出しておく必要がある
+            # pop() より前に start と samples を取り出しておく必要がある
+            seg_start = int(self.vad.front.start)
             samples = np.asarray(self.vad.front.samples, dtype=np.float32)
             self.vad.pop()
-            if self._pending_prefixes:
-                prefix = self._pending_prefixes.popleft()
-                if len(prefix):
-                    samples = np.concatenate([prefix, samples])
+            # VADは静かな話し始めを取りこぼすことがあるため、区間開始の直前を
+            # 履歴から前置きする（直前の区間の末尾は越えない）
+            pad_start = max(self._last_segment_end, seg_start - HEAD_PAD_SAMPLES, 0)
+            prefix = self._history_slice_locked(pad_start, seg_start)
+            self._last_segment_end = seg_start + len(samples)
+            if len(prefix):
+                samples = np.concatenate([prefix, samples])
             duration = len(samples) / SAMPLE_RATE
             if duration < MIN_SEGMENT_SECONDS:
                 continue
@@ -394,6 +481,25 @@ class VoiceInputApp(rumps.App):
             label = "録音停止: 最終区間" if is_final else "発話区切りを検出"
             log.info("%s: %.1f秒 target_pid=%s", label, duration, target_pid or app_target_pid(target_app))
             self._segment_queue.put((_apply_fade(samples), target_app, target_pid))
+
+    def _history_slice_locked(self, start, end):
+        """履歴バッファから [start, end) のサンプルを取り出す。
+
+        呼び出し元で self._vad_lock を保持していること。
+        """
+        if end <= start:
+            return np.array([], dtype=np.float32)
+        parts = []
+        for block_start, block in self._history:
+            block_end = block_start + len(block)
+            if block_end <= start:
+                continue
+            if block_start >= end:
+                break
+            parts.append(block[max(0, start - block_start):end - block_start])
+        if not parts:
+            return np.array([], dtype=np.float32)
+        return np.concatenate(parts)
 
     def _segment_worker_loop(self):
         while True:
@@ -497,9 +603,13 @@ class VoiceInputApp(rumps.App):
         return corrected
 
     def open_settings(self, sender=None):
-        from voice_input_tool.settings_ui import SettingsWindowController
         from Cocoa import NSApp
-        self._settings_ctrl = SettingsWindowController.alloc().initWithCallback_(self._on_settings_saved)
+        # ウィンドウの作成・破棄を繰り返すとPyObjC側の参照管理と重なって
+        # まれにネイティブクラッシュを起こすことがあるため、コントローラーは
+        # 一度作成したらアプリ終了まで使い回す（閉じるときは非表示にするだけ）
+        if self._settings_ctrl is None:
+            from voice_input_tool.settings_ui import SettingsWindowController
+            self._settings_ctrl = SettingsWindowController.alloc().initWithCallback_(self._on_settings_saved)
         self._settings_ctrl.show()
         NSApp.activateIgnoringOtherApps_(True)
 
@@ -523,14 +633,14 @@ class VoiceInputApp(rumps.App):
         self.llm_status.title = "LLM補正: ON" if self.use_llm else "LLM補正: OFF"
         if not self.is_recording:
             self._close_audio_stream()
-        # ホットキー再登録
+        # ホットキー反映（リスナースレッドは再起動せず、判定用オブジェクトのみ差し替え）
         self._register_hotkey()
         self._set_status(self._current_status(), force=True)
         log.info(f"設定更新: LLM={'ON' if self.use_llm else 'OFF'}, "
                  f"ホットキー={new_config.get('hotkey_record')}, "
                  f"入力マイク={new_config.get('input_device_id', '') or '自動選択'}")
 
-    def quit_app(self):
+    def quit_app(self, sender=None):
         self.stop_recording()
         self._stop_status_icon_animation()
         self._close_audio_stream()

@@ -79,8 +79,12 @@ class AppStatusController:
         with self.lock:
             return self.status
 
-    def restore_recording_status(self, is_recording):
-        self.set("listening" if is_recording else "idle")
+    def restore_recording_status(self, is_recording, is_speech_active=False):
+        if not is_recording:
+            self.set("idle")
+        else:
+            # セグメント処理中も発話が続いている場合は「入力中」表示を維持する
+            self.set("hearing" if is_speech_active else "listening")
 
     def set_menu_bar_indicator(self, title, icon_frames=None):
         if self.headless:

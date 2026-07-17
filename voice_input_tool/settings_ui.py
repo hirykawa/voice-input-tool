@@ -220,7 +220,9 @@ class HotkeyField(NSTextField):
         chars = event.charactersIgnoringModifiers()
         if chars and len(chars) == 1 and chars.isprintable():
             return str(chars).lower()
-        return f"key{keycode}"
+        # pynput が解析できないキーを保存するとホットキー登録自体が
+        # 失敗してしまうため、未知のキーは受け付けない
+        return None
 
 
 class SettingsWindowController(NSObject):
@@ -373,11 +375,19 @@ class SettingsWindowController(NSObject):
         save_config(config)
         if self.on_save_callback:
             self.on_save_callback(config)
-        self.window.close()
+        self._hide()
 
     @objc.typedSelector(b"v@:@")
     def cancelClicked_(self, sender):
-        self.window.close()
+        self._hide()
+
+    def _hide(self):
+        # ウィンドウを破棄(close)すると、PyObjC側の参照管理と重なって
+        # まれにネイティブクラッシュを起こすことがあるため、非表示にして
+        # ウィンドウ・コントローラーは使い回す。
+        # ホットキー欄がキャプチャ中のまま隠れないよう、フォーカスも外す
+        self.window.makeFirstResponder_(None)
+        self.window.orderOut_(None)
 
     @objc.typedSelector(b"v@:@")
     def resetClicked_(self, sender):
@@ -388,6 +398,16 @@ class SettingsWindowController(NSObject):
         self.prompt_textview.setString_(DEFAULTS["llm_prompt"])
 
     def show(self):
+        self._refresh_from_config()
         self.window.center()
         self.window.makeKeyAndOrderFront_(None)
         NSApp.activateIgnoringOtherApps_(True)
+
+    def _refresh_from_config(self):
+        """ウィンドウを使い回す際、表示中の値を最新の設定で更新する"""
+        config = load_config()
+        self.llm_checkbox.setState_(NSControlStateValueOn if config["use_llm"] else NSControlStateValueOff)
+        self.api_key_field.setStringValue_(config.get("openrouter_api_key", ""))
+        self.hotkey_record_field.setHotkeyValue_(config.get("hotkey_record", "<ctrl>+<shift>+<space>"))
+        self._populate_input_devices(config.get("input_device_id", ""))
+        self.prompt_textview.setString_(config.get("llm_prompt", ""))

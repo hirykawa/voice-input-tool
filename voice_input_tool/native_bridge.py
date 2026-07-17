@@ -112,8 +112,13 @@ class NativeCommandReader:
         if current_size == self.offset:
             return []
 
-        with open(self.path, "r", encoding="utf-8") as f:
+        # バイト単位のオフセットで読み進めるためバイナリで開く。
+        # 書き込み途中の行（末尾に改行がない部分）は消費せず次回に回す
+        with open(self.path, "rb") as f:
             f.seek(self.offset)
-            commands = f.read().splitlines()
-            self.offset = f.tell()
-        return commands
+            data = f.read()
+        end = data.rfind(b"\n")
+        if end < 0:
+            return []
+        self.offset += end + 1
+        return data[:end].decode("utf-8", errors="replace").splitlines()
