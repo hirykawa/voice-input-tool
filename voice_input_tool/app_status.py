@@ -79,8 +79,12 @@ class AppStatusController:
         with self.lock:
             return self.status
 
-    def restore_recording_status(self, is_recording):
-        self.set("listening" if is_recording else "idle")
+    def restore_recording_status(self, is_recording, is_speech_active=False):
+        if not is_recording:
+            self.set("idle")
+        else:
+            # セグメント処理中も発話が続いている場合は「入力中」表示を維持する
+            self.set("hearing" if is_speech_active else "listening")
 
     def set_menu_bar_indicator(self, title, icon_frames=None):
         if self.headless:
@@ -130,6 +134,9 @@ class AppStatusController:
             "hearing": ("", f"録音停止・音声入力中… ({hotkey_display})", TYPING_INDICATOR_ICON_FRAMES),
             "processing": ("📝", "音声認識中…", None),
             "correcting": ("🧠", "LLM補正中…", None),
+            "polishing": ("✨", "文章を整形中…", None),
+            # パネルで Enter/Esc を待っている。この間にホットキーを押すと新しい録音が始まる
+            "confirm": ("✅", f"確認待ち・録音開始 ({hotkey_display})", None),
             "inserting": ("⌨️", "カーソル位置へ入力中…", None),
         }
         return states.get(status, states["idle"])

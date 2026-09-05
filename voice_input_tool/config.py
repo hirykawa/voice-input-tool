@@ -17,9 +17,13 @@ DOTENV_PATH = os.path.join(CONFIG_DIR, ".env")
 
 DEFAULTS = {
     "use_llm": True,
+    "llm_backend": "openrouter",  # "openrouter" | "ollama"
     "openrouter_api_key": "",  # 保持はするが、ファイル保存はしない
     "llm_model": "openai/gpt-oss-120b",
     "llm_provider_order": ["Cerebras"],
+    "ollama_base_url": "http://127.0.0.1:11434/v1",
+    "ollama_model": "qwen3:8b",
+    "ollama_timeout": 60.0,
     "hotkey_record": "<ctrl>+<shift>+<space>",
     "input_device_id": "",
     "llm_prompt": (
@@ -28,6 +32,19 @@ DEFAULTS = {
         "フィラー（あー、えー、まー）の削除のみ許可します。\n"
         "話し言葉を書き言葉に変換しないでください。\n"
         "出力は補正後のテキストのみとし、説明やコメントは一切付けないでください。"
+    ),
+    # 録音停止後に、その回に入力した全文をまとめて整形し直す
+    "final_polish": True,
+    "final_polish_prompt": (
+        "以下は音声認識の結果です。読みやすい文章に整えてください。\n"
+        "- フィラー（あー、えー、まー、そのー）は削除する\n"
+        "- 句読点を適切に入れる\n"
+        "- 音声認識の明らかな誤変換は前後の文脈から修正する\n"
+        "- 言い直しや重複した言い回しは整理する\n"
+        "- 内容の追加・要約・意図の変更はしない\n"
+        "- 敬体／常体は元の話し方に合わせる\n"
+        "- 改行は入れず、1行で出力する\n"
+        "出力は整形後のテキストのみとし、説明やコメントは一切付けないでください。"
     ),
 }
 

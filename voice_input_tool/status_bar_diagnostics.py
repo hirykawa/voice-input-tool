@@ -37,7 +37,7 @@ def install_status_bar_diagnostics():
                 mainmenu.add(quit_button)
                 log.info("終了メニュー追加完了")
             else:
-                log.warning("終了メニューは無効です")
+                log.info("rumps標準の終了メニューは無効です（アプリ側のメニューを使用）")
 
             self.nsstatusitem.setMenu_(mainmenu._menu)
             log.info("ステータスバーメニュー設定完了")
